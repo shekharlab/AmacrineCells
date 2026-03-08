@@ -1,0 +1,968 @@
+---
+title: "Species-level amacrine cell analysis"
+output: 
+  BiocStyle::html_document:
+    toc: true
+date: "2023-06-01"
+params:
+  species: Chicken_reclustered
+  initial: TRUE
+  batch_int: TRUE
+  integrate_by: "animal"
+  harmony: TRUE
+  contamination_threshold: 6
+  contamination: 
+  nFeature_threshold: -2.5
+  doublet_finder: TRUE
+  manual_annotation: 
+  sac_annotation: FALSE
+  de_expression: TRUE
+  save: FALSE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+source("../../utils/dario_functions.R")
+
+# Load libraries
+LoadLibraries(load.lisi = TRUE)
+SourceFiles()
+
+# Orthologous genes
+# orthology_all_others = readRDS("../../utils/orthology_all_others_v4.rds")
+
+# Booleans to control which analyses to perform
+INITIAL = params$initial
+BATCH_INT = params$batch_int
+DOUBLET_FINDER = params$doublet_finder
+SAC_ANNOTATION = params$sac_annotation
+DE_EXPRESSION = params$de_expression
+SAVE = params$save
+REPROCESS = TRUE
+
+# File paths to read and write
+initial_filepath = paste0("../../Species_Objects/", params$species, "_initial.rds")
+amacrine_filepath = paste0("../../Species_Objects/", params$species, "AC_v1.rds")
+batchcor_filepath = paste0("../../Species_Objects/", params$species, "AC_v2_seurat.rds")
+harmony_filepath = paste0("../../Species_Objects/", params$species, "AC_v2_harmony.rds")
+doublet_filepath = paste0("../../Species_Objects/", params$species, "AC_v3.rds")
+filtered_filepath = paste0("../../Species_Objects/", params$species, "AC_v4.rds")
+final_filepath = paste0("../../Species_Objects/", params$species, "AC_v5.rds")
+markers_filepath = paste0("../../Species_Markers/", params$species, "AC_markers.rds")
+annotation_filepath = paste0("../../Species_Annotations/", params$species, "AC_anno.rds")
+```
+
+Check parameters
+
+```{r}
+params
+```
+
+# Extract amacrines from full retina object
+
+```{r, eval = INITIAL}
+# Read in full object
+species_initial = readRDS(initial_filepath)
+
+# Print object to show number of cells and features
+message(paste0(capture.output(species_initial), collapse = "\n"))
+```
+
+## Convert genes to common mouse symbols if necessary:
+
+Exceptions: 
+
+* Not for rhabdomys and treeshrew since we used custom genomes and not ENSEMBL genomes
+* Not for human, as this caused issues with underscores
+* Custom conversion for lamprey from StringTie annotations (courtesy of Yirong Peng)
+
+Original features are found in species_initial@misc$orig.features
+
+```{r, eval = INITIAL}
+if(params$species %in% c("Macaque", "Marmoset", "Peromyscus", "Squirrel",
+                         "Opossum", "Cow", "Sheep", "Lizard", "Mouse", 
+                         "Pig", "Chicken", "Ferret", "Zebrafish", 
+                         "MouseLemur", "Rat", "Mouse", "Lamprey")){
+  species_initial = ConvertGeneSymbols(species_initial, "../../Orthology/martMergeRefHuman.txt", params$species) 
+  
+  # Check that original feature names were saved correctly and that no genes were lost
+  stopifnot(length(rownames(species_initial@assays$RNA@counts)) == length(species_initial@misc$orig.features))
+  
+} else if(params$species %in% c("Goldfish")){
+  # goldfish_key = fread("../../Orthology/ZF_LA_SB_symbol_for_Seurat.txt")
+  # new_genes = goldfish_key$V3[match(rownames(object), goldfish_key$V7)]
+  # object@misc$orig.features = rownames(object@assays$RNA@counts)
+  # rownames(object@assays$RNA@counts) = new_genes
+  # rownames(object@assays$RNA@data) = new_genes
+  
+  # Goldfish has whole genome duplication so all symbols are duplicated
+  species_initial = ConvertGeneSymbols(species_initial, "../../Orthology/martMergeRefHuman.txt", params$species, make.unique = FALSE) 
+  metadata = species_initial@meta.data
+  
+  # Aggregate duplicated genes
+  mydat = as.data.frame(as.matrix(species_initial@assays$RNA@counts))
+  mydat$gene = rownames(species_initial)
+  mydat.sum <- aggregate(. ~ gene, data = mydat, sum)
+  
+  # Check that it worked
+  mydat[mydat$gene == "rbfox1",30:40]
+  mydat.sum[mydat.sum$gene == "rbfox1",30:40]
+  
+  # Transfer metadata
+  rownames(mydat.sum) = mydat.sum$gene
+  species_initial2 <- CreateSeuratObject(mydat.sum[,colnames(mydat.sum) != "gene"])
+  species_initial2 = TransferMetadata(from = species_initial, to = species_initial2)
+  species_initial = species_initial2
+  
+  # Change meta features or will cause issues downstream
+  # species_initial[["RNA"]]@meta.features <- data.frame(row.names = rownames(species_initial[["RNA"]]))
+}
+```
+
+## Inspect object to find SACs
+
+```{r, fig.height=2.5, fig.width = 15, eval = INITIAL}
+if(params$species %in% c("Macaque")) species_initial$seurat_clusters = species_initial$annotated
+Idents(species_initial) = "seurat_clusters"
+species_initial = UpperCase_genes(species_initial)
+DotPlot(species_initial, features = rev(c("PAX6", "TFAP2A", "TFAP2B", "CHAT", "SLC5A7"))) + coord_flip() + RotatedAxis()
+```
+
+```{r, fig.height=4, fig.width=15, eval = INITIAL}
+# For previously analyzed datasets, we will use annotated instead of seurat clusters
+# if(params$species == "Chicken") species_initial$seurat_clusters = species_initial$annotated
+
+# Fails for chicken and zebrafish because seurat_clusters are not always in the same cell class
+if(params$species == "Chicken"){
+  # species_initial$cell_class = ifelse(startsWith(as.character(species_initial$annotated), "AC-"), "AC", "Other")
+  # DotPlot(species_initial, features = rev(Genes(major_annotation))) + coord_flip()
+  
+  # Convert to major cell class
+  species_initial$cell_class = as.character(species_initial$cell_class)
+  species_initial$cell_class[species_initial$cell_class == "GabaAC" | species_initial$cell_class == "GlyAC"] = "AC"
+  species_initial$cell_class[species_initial$cell_class == "BP"] = "BC"
+  # species_initial$cell_class[!species_initial$cell_class %in% Annotation(major_annotation)] = "Other"
+  species_initial$cell_class[species_initial$cell_class == "MicroG"] = "Other"
+  
+  AnnotatedUmap(species_initial, major_annotation_custom, group.by = "cell_class", color.clusters.by = "cell_class")
+  
+  # plot_grid(
+  #   DimPlot(species_initial, group.by = "cell_class"), 
+  #   AnnotatedDotPlot(species_initial, major_annotation, group.by = "cell_class", color.clusters.by = "cell_class", features = rev(Genes(major_annotation)), color.genes = FALSE) + coord_flip() + RotatedAxis(),
+  # rel_widths = c(1,2.5))
+  
+  plot_grid(
+      DimPlot(species_initial, group.by = "cell_class"),
+      AnnotatedDotPlot(species_initial, major_annotation, group.by = "cell_class", color.clusters.by = "cell_class",
+                       features = rev(Genes(major_annotation)), color.genes = FALSE) + coord_flip() + RotatedAxis(),
+      rel_widths = c(1,2.5)
+    )
+  
+} else if(params$species %in% c("Zebrafish", "Goldfish")){
+  DotPlot(species_initial, features = rev(Genes(major_annotation))) + coord_flip()
+} else {
+  
+  # Convert to major cell class
+  species_initial$cell_class = as.character(species_initial$cell_class)
+  species_initial$cell_class[species_initial$cell_class == "GabaAC" | species_initial$cell_class == "GlyAC"] = "AC"
+  species_initial$cell_class[species_initial$cell_class == "BP"] = "BC"
+  # species_initial$cell_class[!species_initial$cell_class %in% Annotation(major_annotation)] = "Other"
+  species_initial$cell_class[species_initial$cell_class == "MicroG"] = "Other"
+
+  # Check if cones and rods are in same cluster
+  if(max(apply(table(species_initial$cell_class, species_initial$seurat_clusters), 2, function(x) length(which(x != 0)))) > 1){
+    species_initial$cell_class[species_initial$cell_class == "Rod" | species_initial$cell_class == "Cone"] = "Rod"
+  }
+  
+  # Default palette for DimPlot
+  palette = c("cyan", "chartreuse2", "red", "gold", "magenta", "grey", "blue", "darkred")
+  if(!"Cone" %in% unique(species_initial$cell_class)) palette = c("cyan", "chartreuse2", "gold", "magenta", "grey", "blue", "darkred")
+  
+  # Plot
+  plot_grid(
+  {if(params$species != "Macaque") DimPlot(species_initial, group.by = "cell_class", cols = palette)}, #c("darkred", "red", "gold", "chartreuse2", "cyan", "blue", "magenta", "grey")
+  AnnotatedDotPlot(species_initial, major_annotation, group.by = "seurat_clusters", color.clusters.by = "cell_class", 
+                 features = rev(Genes(major_annotation)), color.genes = FALSE) + coord_flip() + RotatedAxis(),
+  rel_widths = c(1,2.5))
+}
+```
+
+## Recover mislabeled ACs if necessary
+
+```{r, eval = INITIAL}
+if(params$species == "Human") species_initial$cell_class[species_initial$seurat_clusters %in% c(5, 14, 24)] = "AC"
+if(params$species == "Lizard") species_initial$cell_class[species_initial$seurat_clusters %in% c(18)] = "AC"
+if(params$species == "Zebrafish") species_initial$cell_class[species_initial$seurat_clusters %in% c(9,18,24)] = "AC"
+if(params$species == "Opossum") species_initial$cell_class[species_initial$seurat_clusters %in% c(1,29,30)] = "AC"
+if(params$species == "Peromyscus") species_initial$cell_class[species_initial$seurat_clusters %in% c(14,48)] = "AC"
+if(params$species == "Cow") species_initial$cell_class[species_initial$seurat_clusters %in% c(8,9,20)] = "AC"
+if(params$species == "Lizard_ncbi") species_initial$cell_class[species_initial$seurat_clusters %in% c(21)] = "AC"
+
+# This seemed to be leading to more doublet-enriched clusters downstream so avoid these three clusters
+# if(params$species == "TreeShrew") species_initial$cell_class[species_initial$seurat_clusters %in% c(38,39,48)] = "AC"
+```
+
+Re-plot if recovered types
+
+```{r, fig.height=8, fig.width=30, eval = INITIAL}
+if(params$species %in% c("Human", "Lizard", "Zebrafish", "Opossum", "Peromyscus", "Cow", "Lizard_ncbi")){
+  plot_grid(
+    {if(params$species != "Macaque") DimPlot(species_initial, group.by = "cell_class", cols = palette)}, #c("darkred", "red", "gold", "chartreuse2", "cyan", "blue", "magenta", "grey")
+    AnnotatedDotPlot(species_initial, major_annotation, group.by = "seurat_clusters", color.clusters.by = "cell_class", 
+                   features = rev(Genes(major_annotation)), color.genes = FALSE) + coord_flip() + RotatedAxis(),
+  rel_widths = c(1,2.5))
+}
+```
+
+## Create separate species AC object
+
+```{r, eval = INITIAL}
+Idents(species_initial) <- "cell_class"
+
+# Subset amacrines. For human, we also subset features because there's so many (60k) which made objects very large
+if(params$species %in% c("Human", "TreeShrew")){
+  speciesAC <- CreateSeuratObject(
+  GetAssayData(
+    subset(species_initial, cells = WhichCells(species_initial, idents = c("AC"))), 
+    slot="counts", assay="RNA"), 
+  min.cells = 3)
+  speciesAC$orig.file = subset(species_initial, cells = WhichCells(species_initial, idents = c("AC")))$orig.file
+} else if(params$species == "Goldfish"){
+  species_initial$orig.file = species_initial$orig.ident
+  speciesAC = subset(species_initial, cells = WhichCells(species_initial, idents = c("GabaAC", "GlyAC")))
+} else {
+  speciesAC = subset(species_initial, cells = WhichCells(species_initial, idents = c("AC")))
+}
+
+# Rename empty gene name in Chicken file as this causes problems downstream
+if(params$species == "Chicken"){
+  rownames(speciesAC@assays$RNA@counts)[rownames(speciesAC@assays$RNA@counts) == ""] <- "EMPTY"
+  rownames(speciesAC@assays$RNA@data)[rownames(speciesAC@assays$RNA@data) == ""] <- "EMPTY" 
+}
+
+# Add donor information for human
+if(params$species == "Human") speciesAC$donor = subset(species_initial, cells = WhichCells(species_initial, idents = c("AC")))$donor
+
+# Add orig.file information for macaque
+if(params$species == "Macaque"){
+  Idents(speciesAC) <- "orig.ident"
+  speciesAC@meta.data$tag <- speciesAC@meta.data$orig.ident
+  speciesAC@meta.data[WhichCells(speciesAC, idents = "MacaqueCD90S1"), "tag"] <- "M1PerCD90S1"
+  speciesAC@meta.data[WhichCells(speciesAC, idents = "MacaqueCD90S2"), "tag"] <- "M1PerCD90S2"
+  # speciesAC@meta.data[WhichCells(speciesAC, idents = "MacaqueCD90S3"), "tag"] <- "M1PerCD90S3" # This ident is missing from the object...
+  speciesAC@meta.data[WhichCells(speciesAC, idents = "MacaqueCD90S4"), "tag"] <- "M1PerCD90S4"
+  speciesAC@meta.data[WhichCells(speciesAC, idents = "MacaqueCD90S5"), "tag"] <- "M2PerCD90S1"
+  speciesAC@meta.data[WhichCells(speciesAC, idents = "MacaqueCD90S6"), "tag"] <- "M2PerCD90S2"
+  speciesAC@meta.data[WhichCells(speciesAC, idents = "MacaqueCD90S7"), "tag"] <- "M3PerCD90S1"
+  speciesAC@meta.data[WhichCells(speciesAC, idents = "MacaqueCD90S8"), "tag"] <- "M3PerCD90S2"
+  speciesAC@meta.data[WhichCells(speciesAC, idents = "MacaqueCD90S9"), "tag"] <- "M3PerCD90S3"
+  speciesAC@meta.data[WhichCells(speciesAC, idents = "MacaqueCD73-S1"), "tag"] <- "M1PerCD73-S1"
+  speciesAC@meta.data[WhichCells(speciesAC, idents = "MacaqueCD73-S2"), "tag"] <- "M1PerCD73-S2"
+  speciesAC@meta.data[WhichCells(speciesAC, idents = "MacaqueCD73-S3"), "tag"] <- "M2PerCD73-S1"
+  speciesAC@meta.data[WhichCells(speciesAC, idents = "MacaqueCD73-DP2S1"), "tag"] <- "M4PerCD73-S1"
+  speciesAC@meta.data[WhichCells(speciesAC, idents = "MacaqueCD73-DP2S2"), "tag"] <- "M4PerCD73-S2"
+  speciesAC@meta.data[WhichCells(speciesAC, idents = "MacaquePeripheryMixedS1"), "tag"] <- "M2PerMixedS1"
+  speciesAC$orig.file = speciesAC$tag
+}
+
+# Remove full object and save amacrine subset
+rm(species_initial)
+
+# Print object to show number of cells and features
+message(paste0(capture.output(speciesAC), collapse = "\n"))
+
+# Save
+saveRDS(speciesAC, amacrine_filepath)
+```
+
+# Quality control 
+
+```{r}
+speciesAC = readRDS(amacrine_filepath)
+```
+
+## Remove channels that contain the class of interest at a frequency less than 60 cells
+
+```{r}
+batch_totals = table(speciesAC$orig.file)
+t(t(batch_totals))
+cat("Total number of ACs: ", sum(batch_totals))
+remove_batches = names(which(batch_totals < 60))
+
+# Custom removal of certain batches in some species due to poor integration 
+if(params$species == "Rhabdomys") remove_batches = c(remove_batches, "RhabNeunPos1b1", "RhabNeunPos1b2", "RhabNeunPos2b1") 
+
+# Remove from peromyscus since too few cells compared to other biological replicates
+# if(params$species == "Peromyscus") remove_batches = c(remove_batches, "Pero1CD73-dpS1", "Pero1CD73-dpS2", "Pero1CD73-dpS3")
+# if(params$species == "Peromyscus") remove_batches = c(remove_batches, "Pero1CD90S1", "Pero1CD90S2", "Pero2CD73-dpS1", "Pero2CD73-dpS2", "Pero3CD73-dpS2") 
+
+if(length(remove_batches) > 0) {
+  speciesAC = subset(speciesAC, orig.file %in% remove_batches, invert = TRUE)
+  message("\nRemoving batches: ", paste0(remove_batches, collapse = ", "))
+}
+```
+
+## Filter out cells with abnormally low/high numbers of unique molecules
+
+Look for mitochondrial genes 
+
+Calculate mitochondrial fraction
+
+```{r}
+rownames(speciesAC)[startsWith(toupper(rownames(speciesAC)), "MT-")]
+speciesAC[["percent.mt"]] <- PercentageFeatureSet(speciesAC, pattern = "^MT-")
+```
+
+Plot distributions
+
+```{r, fig.width = 6, fig.height=3}
+if(params$species == "Peromyscus"){
+  feature.low = 2000 
+# } else if(params$species == "Goldfish"){
+#   feature.low = 200 
+} else {
+  feature.low = max(mean(speciesAC$nFeature_RNA) - 3*sd(speciesAC$nFeature_RNA), 400)
+}
+
+feature.high = min(mean(speciesAC$nFeature_RNA) + 3*sd(speciesAC$nFeature_RNA), 6000)
+mt.high = 20
+
+plot_grid(PrettyHistogram(speciesAC$nFeature_RNA, 
+                          vline = c(feature.low, feature.high)), 
+          BINplot(speciesAC, 
+                  feature.high = feature.high, 
+                  feature.low = feature.low, 
+                  percent.mt.high = mt.high), 
+          ncol = 2)
+```
+
+Remove cells
+
+```{r}
+message("Removing ", length(which(speciesAC$nFeature_RNA < feature.low)), " cells with nFeatures < ", feature.low)
+message("Removing ", length(which(speciesAC$nFeature_RNA > feature.high)), " cells with nFeatures > ", feature.high)
+message("Removing ", length(which(speciesAC$percent.mt > mt.high)), " cells with percent.mt > ", mt.high)
+
+speciesAC <- subset(speciesAC, subset = percent.mt < mt.high & nFeature_RNA < feature.high & nFeature_RNA > feature.low)
+```
+
+# Batch integration
+
+Assign batch information for species
+
+```{r}
+# Read in species metadata
+species_metadata = read.csv("../../Species_Objects/sample_metadata2.csv")
+# colnames(species_metadata) = c("channel", "description")
+
+if(params$species == "Human") {
+  # speciesAC$region = "Peri"; speciesAC$region[grepl("OSm|macula|Mix", speciesAC$orig.file)] = "Mac"
+  # speciesAC$enrichment = "NONE"; speciesAC$enrichment[grepl("NeuN|PRet|RGC", speciesAC$orig.file)] = "NeuN+"
+  # speciesAC$batch = paste0(speciesAC$region, "_", speciesAC$donor)
+  # speciesAC$animal = speciesAC$donor
+  speciesAC$region = toupper(str_split_fixed(species_metadata$description[match(speciesAC$orig.file, species_metadata$channel)], "_", 3)[,1])
+  speciesAC$enrichment = toupper(str_split_fixed(species_metadata$description[match(speciesAC$orig.file, species_metadata$channel)], "_", 3)[,2])
+  speciesAC$animal = gsub("A", "", gsub("B", "", gsub("C", "", toupper(str_split_fixed(species_metadata$description[match(speciesAC$orig.file, species_metadata$channel)], "_", 3)[,3]))))
+  speciesAC$donor = speciesAC$animal
+} else if(params$species == "Goldfish"){
+  speciesAC$enrichment = "NONE"
+  speciesAC$animal = speciesAC$orig.ident
+} else if(params$species == "Macaque") {
+  # Region 
+  speciesAC$region = "Periphery"
+  speciesAC$region[grepl("Fovea", speciesAC$orig.ident, fixed = TRUE)] = "Fovea"
+  
+  # Animal
+  speciesAC$animal = substr(speciesAC$tag, 0, 2)
+  speciesAC$animal[startsWith(speciesAC$tag, "M1Per")] = "M5"
+  speciesAC$animal[startsWith(speciesAC$tag, "M2Per")] = "M6"
+  speciesAC$animal[startsWith(speciesAC$tag, "M3Per")] = "M7"
+  
+  # Enrichment type
+  speciesAC$enrichment = "NONE"
+  speciesAC$enrichment[grepl("CD90|Mixed", speciesAC$tag)] = "CD90+"
+  speciesAC$enrichment[grepl("CD73-", speciesAC$tag)] = "CD73-"
+  
+  # speciesAC$batch = paste0(speciesAC$region, "_", speciesAC$animal, "_", speciesAC$enrichment)
+  speciesAC$batch = paste0(speciesAC$region, "_", speciesAC$animal)
+} else if(params$species == "Marmoset") {
+  speciesAC$region = toupper(str_split_fixed(species_metadata$description[match(speciesAC$orig.file, species_metadata$channel)], "_", 3)[,1])
+  speciesAC$enrichment = toupper(str_split_fixed(species_metadata$description[match(speciesAC$orig.file, species_metadata$channel)], "_", 3)[,2])
+  speciesAC$animal = gsub("A", "", gsub("B", "", gsub("C", "", toupper(str_split_fixed(species_metadata$description[match(speciesAC$orig.file, species_metadata$channel)], "_", 3)[,3]))))
+} else {
+  speciesAC$enrichment = toupper(str_split_fixed(species_metadata$description[match(speciesAC$orig.file, species_metadata$channel)], "_", 2)[,1])
+  speciesAC$animal = gsub("A", "", gsub("B", "", gsub("C", "", toupper(str_split_fixed(species_metadata$description[match(speciesAC$orig.file, species_metadata$channel)], "_", 2)[,2]))))
+}
+
+addmargins(table(speciesAC$enrichment, speciesAC$orig.file))
+addmargins(table(speciesAC$animal, speciesAC$orig.file))
+
+# Dispersion calculation
+sd(table(speciesAC$animal))/mean(table(speciesAC$animal))
+sd(table(speciesAC$orig.file))/mean(table(speciesAC$orig.file))
+```
+
+## Check for batch effects
+
+```{r, fig.width=15, fig.height=7}
+speciesAC = ClusterSeurat(speciesAC, cluster_resolution = 1.5)
+plotBatches2(speciesAC, batch = 'orig.file')
+```
+
+Cluster each batch separately to compute celltype LISI later on
+
+```{r}
+speciesAC$batch_clusters = ClusterBatches(speciesAC, batch = params$integrate_by, resolution = 1.5)
+```
+
+Check for batch effects using integration LISI and cell type LISI
+
+```{r, fig.width=10, fig.height=6}
+# iLISI computation is for all cells together
+iLISI_before <- compute_lisi(speciesAC@reductions$pca@cell.embeddings[,1:20], # speciesAC@reductions$umap@cell.embeddings
+                              speciesAC@meta.data, 
+                              c(params$integrate_by))
+
+# cLISI computation is for each batch since we don't have cell type info a priori
+cLISI_before = ComputeCelltypeLISI(speciesAC, batch = params$integrate_by)
+```
+
+## Tabulate batches used for integration
+
+```{r}
+t(t(table(speciesAC[[params$integrate_by]])))
+```
+
+## Seurat integration
+
+```{r, eval = BATCH_INT}
+# Save orig.features which would be lost during integration
+orig.features = speciesAC@misc$orig.features
+
+# Integrate
+speciesAC = ClusterSeurat(speciesAC, integrate.by = params$integrate_by, cluster_resolution = 1.5)
+
+# Preserve orig.features
+speciesAC@misc$orig.features = orig.features
+
+# Save
+saveRDS(speciesAC, batchcor_filepath)
+```
+
+Confirm seurat integration was successful
+
+```{r, fig.width=15, fig.height=7}
+speciesAC = readRDS(batchcor_filepath)
+plotBatches2(speciesAC, batch = params$integrate_by)
+```
+
+Check for batch effects using integration LISI and celltype LISI
+
+```{r, fig.width=10, fig.height=6}
+iLISI_seurat <- compute_lisi(speciesAC@reductions$pca@cell.embeddings[,1:20], 
+                              speciesAC@meta.data, 
+                              c(params$integrate_by))
+
+cLISI_seurat = ComputeCelltypeLISI(speciesAC, batch = params$integrate_by)
+```
+
+## Harmony integration
+
+```{r, eval = BATCH_INT, fig.width=15, fig.height=6}
+DefaultAssay(speciesAC) = "RNA"
+speciesAC = Harmonize(speciesAC, batch = params$integrate_by, cluster_resolution = 1.5)
+saveRDS(speciesAC, harmony_filepath)
+```
+
+Confirm harmony integration was successful
+
+```{r, fig.width=15, fig.height=7}
+speciesAC = readRDS(harmony_filepath)
+plotBatches2(speciesAC, batch = params$integrate_by)
+```
+
+Check for batch effects using integration LISI and celltype LISI
+
+```{r, fig.width=10, fig.height=6}
+# Use harmony embeddings for iLISI
+iLISI_harmony <- compute_lisi(speciesAC@reductions$harmony@cell.embeddings, 
+                              speciesAC@meta.data, 
+                              c(params$integrate_by))
+
+cLISI_harmony = ComputeCelltypeLISI(speciesAC, batch = params$integrate_by, harmony = TRUE)
+```
+
+## Summarize batch correction metrics
+
+```{r, fig.height=6, fig.width=8}
+par(mfrow = c(1,2))
+iLISI = data.frame(before = iLISI_before[[params$integrate_by]], 
+                   seurat = iLISI_seurat[[params$integrate_by]], 
+                   harmony = iLISI_harmony[[params$integrate_by]])
+boxplot(iLISI)
+cLISI = data.frame(before = cLISI_before$batch_clusters, 
+                   seurat = cLISI_seurat$batch_clusters, 
+                   harmony = cLISI_harmony$batch_clusters)
+boxplot(cLISI)
+```
+
+## Choose batch correction method
+
+```{r, fig.width=14, fig.height=8}
+if(params$harmony){
+  message("Using Harmony integration")
+  speciesAC = readRDS(harmony_filepath)
+} else {
+  message("Using Seurat integration")
+  speciesAC = readRDS(batchcor_filepath)
+}
+```
+
+Quickly check which clusters were enriched by FACs
+
+```{r, fig.width=14, fig.height=8}
+# CD90 is Thy1, CD73 is NT5E, SLC17A6 is VGLUT2, RBFOX3 is NEUN, VSX2 is CHX10 
+enrichment_markers = c("THY1", "NT5E", "SLC17A6", "RBFOX3", "VSX2", "ISL2B")
+FeaturePlot(speciesAC, features = enrichment_markers, ncol = 3)
+
+VlnPlot(speciesAC, 
+        features = enrichment_markers, 
+        group.by = "enrichment", pt.size = 0.1, 
+        ncol = 3)
+```
+
+# Filter out contamination, low quality clusters, and doublets
+
+## Check for contamination from other cell classes
+
+```{r, fig.height=6, fig.width=15}
+AnnotatePlot(DotPlot(speciesAC, features = rev(Genes(amacrine_annotation))) + coord_flip() + RotatedAxis(), 
+             amacrine_annotation, color_genes_x = TRUE)
+```
+
+```{r, fig.height=6, fig.width=15}
+AnnotatePlot(DotPlot(speciesAC, features = rev(Genes(major_annotation))) + coord_flip() + RotatedAxis(), 
+             major_annotation, color_genes_x = TRUE)
+```
+
+```{r, eval = FALSE}
+# For interactive assignment
+speciesAC@misc$contamin.clusters = list(rod = NA, cone = c(38), hc = c(NA), bc = c(13,18), ac = NA, rgc = NA, mg = NA)
+```
+
+```{r, fig.height=5, fig.width=15}
+if(FALSE){
+  speciesAC = ScaleData(speciesAC, features = Genes(major_annotation))
+  
+  gs_list = list()
+  gs_list$gs_positive = list(Rod = setdiff(Genes(major_annotation)[Annotation(major_annotation) == "Rod"], "RHO"), 
+                             Cone = Genes(major_annotation)[Annotation(major_annotation) == "Cone"],
+                             HC = "LHX1", 
+                             BC = setdiff(Genes(major_annotation)[Annotation(major_annotation) == "BC"], "GRIK1"), 
+                             AC = Genes(major_annotation)[Annotation(major_annotation) == "AC"], 
+                             RGC = Genes(major_annotation)[Annotation(major_annotation) == "RGC"], 
+                             MG = setdiff(Genes(major_annotation)[Annotation(major_annotation) == "MG"], "SLC1A3"))
+  gs_list$gs_negative = list(Rod = NULL, 
+                             Cone = NULL,
+                             HC = NULL, 
+                             BC = NULL, 
+                             AC = NULL, 
+                             RGC = NULL, 
+                             MG = NULL)
+  
+  speciesAC = ScTypeAnnotation(speciesAC, gs_list)
+  
+  
+} else {
+  # speciesAC = ProfileContamination(speciesAC, z.score.threshold = params$contamination_threshold)
+  if(!is.null(params[["contamination"]])) speciesAC@misc$contamin.clusters = params[["contamination"]]
+  contamin.clusters = sort(unique(unlist(speciesAC@misc$contamin.clusters)))
+  message("Contaminated clusters: ", paste0(contamin.clusters, collapse = ", "))
+}
+
+# AnnotatedDotPlot(speciesAC, major_annotation, group.by = "seurat_clusters", color.clusters.by = "customclassif", 
+#                features = rev(Genes(major_annotation)), color.genes = FALSE) + coord_flip() + RotatedAxis()
+```
+
+## Check for low quality clusters
+
+```{r, fig.height=12, fig.width = 20}
+BrowseSeurat(speciesAC, batch = params$integrate_by)
+```
+
+```{r}
+lowq.clusters = which(scale(MeanMetadata(speciesAC, feature.1 = "seurat_clusters", feature.2 = "nFeature_RNA")) < params$nFeature_threshold) - 1
+message("Low quality clusters: ", paste0(lowq.clusters, collapse = ", "))
+```
+
+## Doublet detection with DoubletFinder
+
+```{r, eval = DOUBLET_FINDER, fig.width = 12, fig.height=10}
+speciesAC = FindDoublets(speciesAC, channels = "orig.file")
+saveRDS(speciesAC, doublet_filepath)
+```
+
+Check quality of doublet detection
+
+```{r, fig.width = 12, fig.height=10}
+speciesAC = readRDS(doublet_filepath)
+DoubletAnalysis(speciesAC)
+```
+
+## Remove contaminated and/or low quality clusters and putative doublets
+
+```{r}
+if(length(lowq.clusters) > 0) lowq.cells = WhichCells(speciesAC, idents = lowq.clusters) else lowq.cells = NULL
+if(length(contamin.clusters) > 0) contamin.cells = WhichCells(speciesAC, idents = contamin.clusters) else contamin.cells = NULL
+doublet.cells = WhichCells(speciesAC, expression = DF.classifications == "Doublet")
+
+message("Found ", length(lowq.cells), " low-quality cells")
+message("Found ", length(contamin.cells), " contaminated cells")
+message("Found ", length(doublet.cells), " putative doublet cells")
+message("Removing ", length(unique(c(lowq.cells, contamin.cells, doublet.cells))), " unique cells in total")
+
+# Remove contaminating clusters
+speciesAC = subset(speciesAC, cells = c(lowq.cells, contamin.cells, doublet.cells), invert = TRUE)
+```
+
+# Re-process after filtration
+
+```{r, eval = REPROCESS}
+if(params$harmony){
+  speciesAC = Harmonize(speciesAC, batch = params$integrate_by, cluster_resolution = 1.5)
+  saveRDS(speciesAC, filtered_filepath)
+} else{
+  speciesAC = ReprocessIntegrated(speciesAC)
+  saveRDS(speciesAC, filtered_filepath)
+}
+```
+
+```{r, fig.width=15, fig.height=6}
+speciesAC = readRDS(filtered_filepath)
+plotBatches2(speciesAC, batch = params$integrate_by)
+```
+
+## Cluster-resolution curve
+Resolution parameter that is most stable based on the cluster-resolution curve
+
+```{r}
+if(params$harmony) {
+  plotClusterRes(speciesAC)
+} else {
+  DefaultAssay(speciesAC) = "integrated"
+  plotClusterRes(speciesAC)
+}
+```
+
+Re-cluster if necessary
+
+```{r}
+# if(params$species == "Pig") speciesAC = FindClusters(speciesAC, resolution = 1.5)
+# if(params$species == "Ferret") speciesAC = FindClusters(speciesAC, resolution = 1.5)
+# if(params$species == "TreeShrew") speciesAC = FindClusters(speciesAC, resolution = 2)
+```
+
+## Cluster dendrogram 
+
+Check cluster similarity based on tree estimated from distance matrix constructed in PCA space
+
+```{r, fig.width=10, fig.height=5}
+DefaultAssay(speciesAC) = "RNA"
+speciesAC = FindVariableFeatures(speciesAC, selection.method = "vst", nfeatures = 2000)
+speciesAC = BuildClusterTree(object = speciesAC)
+PlotClusterTree(speciesAC)
+```
+
+## Merge clusters
+
+```{r}
+speciesAC$old_seurat_clusters = speciesAC$seurat_clusters
+speciesAC = mergeClusters(speciesAC)
+```
+
+ Check that merging was successful
+
+```{r, fig.width=10, fig.height=10}
+if(length(unique(speciesAC$old_seurat_clusters)) != length(unique(speciesAC$seurat_clusters))) {
+  
+  # Recompute cluster tree if clustering changed
+  speciesAC = BuildClusterTree(object = speciesAC)
+  
+  # Plot confusion matrix
+  plotConfusionMatrix(table(speciesAC$seurat_clusters, speciesAC$old_seurat_clusters), stagger.threshold = 1)
+}
+```
+
+Visualize final clusters
+
+```{r, fig.height=12, fig.width = 20}
+BrowseSeurat(speciesAC, batch = params$integrate_by)
+```
+
+Remove any remaining low quality clusters
+
+```{r}
+# if(params$species == "TreeShrew") speciesAC = subset(speciesAC, idents = 40, invert = TRUE)
+```
+
+Plot final clusters by batch
+
+```{r, fig.height=6, fig.width=15}
+plotBatches2(speciesAC, batch = params$integrate_by)
+```
+
+# GABAergic vs glycinergic classification
+
+Markers:
+
+* SLC32A1 is transporter required for both GABA and glycine uptake into synaptic vesicles
+* Slc6a1, Slc6a13,and Slc6a11 encode GABA transporter types 1, 2, and 3, respectively
+* Gad1 and Gad2 encode two forms of glutamate decarboxylase
+* Slc6a9 and Slc6a5 encode vesicular glycine transporters 1 and 2, respectively
+
+## GAD vs GlyT1 expression
+
+For treeshrew, GAD1 has low counts due to poor annotation, so we use SLC6A1
+
+```{r, fig.width=12, fig.height=4}
+Gaba.gene.1 = ifelse(params$species == "TreeShrew", "SLC6A1", "GAD1")
+Gaba.gene.2 = ifelse(params$species == "TreeShrew", "SLC6A11", "GAD2")
+speciesAC = GabaGlyClassification(speciesAC, Gaba.gene.1 = Gaba.gene.1, Gaba.gene.2 = Gaba.gene.2)
+order = arrange(Metadata(speciesAC, feature.1 = "seurat_clusters", feature.2 = "classification"), classification)$seurat_clusters
+speciesAC$ac.order = factor(speciesAC$seurat_clusters, levels = order)
+```
+
+```{r}
+t(t(table(speciesAC$classification)))
+```
+
+## Clustered DotPlot
+
+```{r, fig.height=4, fig.width=15}
+ClusteredDotplot(speciesAC, 
+                 # dendrogram = phylogram::as.dendrogram(speciesAC@tools$BuildClusterTree), 
+                 order = "ac.order",
+                 features = toupper(c("Slc32a1", "Slc6a1", "Slc6a13", "Slc6a11", "Gad1", "Gad2", "Slc6a9", "Slc6a5")))
+```
+
+# Manual annotation of cell types
+
+## Ensure all contamination was removed 
+
+```{r, fig.height=6, fig.width=15}
+AnnotatePlot(DotPlot(speciesAC, features = rev(Genes(major_annotation))) + coord_flip() + RotatedAxis(), 
+             major_annotation, color_genes_x = TRUE)
+``` 
+
+## Plot amacrine cell type markers
+
+```{r, fig.height=5.5, fig.width=15}
+# AnnotatePlot(DotPlot(speciesAC, features = rev(Genes(amacrine_annotation))) + coord_flip() + RotatedAxis(), 
+#              amacrine_annotation, color_genes_x = TRUE)
+
+AnnotatePlot(
+  OrderedDotPlot(speciesAC, amacrine_annotation, group.by = "seurat_clusters", color.clusters.by = "seurat_clusters", order = order, features = rev(c(Gaba.gene.1, Gaba.gene.2, "SLC6A9", Genes(amacrine_annotation)))), 
+  amacrine_annotation, color_genes_x = TRUE) + coord_flip() + RotatedAxis()
+```
+
+## Cluster annotations based on marker expression
+
+manual_annotation = list(SAC = c(2), A17 = c(NA), nNOS = c(63), CA1 = c(17), CA2 = c(NA), VG1 = c(NA), A2 = c(1), SEG = c(14,22), VG3 = 40)
+
+```{r}
+# manual_annotation = eval(parse(text = params$manual_annotation))
+manual_annotation = params$manual_annotation
+```
+
+```{r}
+# Assign annotations
+speciesAC = AssignAnnotations(speciesAC, manual_annotation)
+
+# Concatenate cluster and lit type
+speciesAC = AssignName(speciesAC)
+
+t(t(table(speciesAC$type)))
+```
+
+Annotated types to one side
+
+```{r, fig.height=5.5, fig.width=15}
+order = arrange(Metadata(speciesAC, feature.1 = "type", feature.2 = "classification", feature.3 = "lit_type"), classification, lit_type)$type
+AnnotatePlot(
+  OrderedDotPlot(speciesAC, amacrine_annotation, group.by = "type", color.clusters.by = "type", order = order, features = rev(c(Gaba.gene.1, Gaba.gene.2, "SLC6A9", Genes(amacrine_annotation)))), 
+  amacrine_annotation, object_y = speciesAC, y_annotation = "lit_type") + coord_flip() + RotatedAxis()
+```
+
+## ON/OFF SAC annotation
+
+```{r}
+# SAC_ANNOTATION = "SAC" %in% speciesAC$lit_type
+```
+
+```{r, fig.height=8, fig.width=15, eval = SAC_ANNOTATION}
+speciesSAC = subset(speciesAC, subset = lit_type == "SAC")
+
+# speciesSAC = ClusterSeurat(speciesSAC)
+
+ON_SAC_markers = c("FEZF1", "GFRA3", "CNTN5", "SLIT2")
+OFF_SAC_markers = c("TENM3", "ZFHX3", "RND3")
+
+plot_grid({if(any(ON_SAC_markers %in% rownames(speciesSAC))) FeaturePlot(speciesSAC, features = ON_SAC_markers, ncol = length(ON_SAC_markers), reduction = "umap")}, 
+          {if(any(OFF_SAC_markers %in% rownames(speciesSAC))) FeaturePlot(speciesSAC, features = OFF_SAC_markers, ncol = length(OFF_SAC_markers),  reduction = "umap")}, 
+            ncol = 1, nrow = 2)
+```
+
+```{r, fig.height=5, fig.width=5, eval = SAC_ANNOTATION}
+speciesSAC$on.sac.markers = PercentageFeatureSet(speciesSAC, features = ON_SAC_markers)
+speciesSAC$off.sac.markers = PercentageFeatureSet(speciesSAC, features = OFF_SAC_markers)
+
+plot_grid(
+  gghistogram(speciesSAC@meta.data, x = "on.sac.markers", xlab = FALSE),
+  NULL, 
+  ggscatter(speciesSAC@meta.data, x = "on.sac.markers", "off.sac.markers"), 
+  gghistogram(speciesSAC@meta.data, x = "off.sac.markers", ylab = FALSE) + coord_flip(), 
+  ncol = 2, nrow = 2, rel_widths = c(2,1), rel_heights = c(1,2), align = "hv")
+```
+
+## Compare our clustering to previous annotations, if they exist
+
+```{r, fig.height=8, fig.width=10}
+if("annotated" %in% colnames(speciesAC@meta.data)){
+  # plotConfusionMatrix(table(speciesAC$annotated, speciesAC$type))
+  JSHeatmap(JSMatrix(t(table(speciesAC$annotated, speciesAC$type))), heatmap = FALSE, stagger.threshold = 0.05)
+}
+```
+
+# Effects of enrichment procedure
+
+Exclude zebrafish from analysis since all samples used were enriched for Isl2b
+Old: Exclude rhabdomys (only using neun- and none)
+
+```{r}
+ENRICHED = "enrichment" %in% colnames(speciesAC@meta.data) & !params$species %in% c("Zebrafish", "Goldfish", "Chicken")
+```
+
+```{r, fig.width=16, fig.height=4, eval = ENRICHED}
+# Get enrichment groups and corresponding markers
+enrichment_groups = toupper(unique(speciesAC$enrichment)[!unique(speciesAC$enrichment) %in% c("NONE", "ALL", "CD73-")])
+markers = (gsub("-", "", gsub("\\+", "", enrichment_groups)))
+markers[markers == "NEUN"] = "RBFOX3"
+markers[markers == "CD90"] = "THY1"
+markers[markers == "CHX10"] = "VSX2"
+
+# Subset to markers whose gene is present in the dataset
+enrichment_groups = enrichment_groups[markers %in% rownames(speciesAC)]
+markers = markers[markers %in% rownames(speciesAC)]
+
+# Plot UMAPs showing enriched populations
+lapply(seq_along(markers), function(index){
+  plot_grid(FeaturePlot(speciesAC, features = markers[[index]]) + NoLegend(), 
+          DimPlot(speciesAC, split.by = "enrichment", group.by = "enrichment") + NoLegend(),
+          VlnPlot(speciesAC, group.by = "enrichment", features = markers[[index]], pt.size = 0),
+          ncol = 3, 
+          rel_widths = c(1, length(unique(speciesAC$enrichment)), 1.5))
+})
+```
+
+## Identify cell types affected by enrichment procedure
+
+```{r, fig.width=10, fig.height=4, eval = ENRICHED}
+lapply(seq_along(markers), function(index){
+  StackedPlots(list(stackedBarGraph(speciesAC, feature.1 = "enrichment", feature.2 = "type") + NoLegend(), 
+          VlnPlot(speciesAC, features = markers[[index]], pt.size = 0, group.by = "type") + NoLegend()))
+})
+```
+
+## Correlation between enriched marker expression and proportion of cells from enriched collections
+
+```{r, fig.width=6, fig.height=6, eval = ENRICHED}
+lapply(seq_along(markers), function(index){
+  enriched.expression = as.data.frame(t(log1p(AverageExpression(speciesAC, features = c(markers[[index]], "PAX6"), group.by = "type")$RNA)))
+  prop.enriched = proportionTable(speciesAC, feature.1 = "enrichment", feature.2 = "type")[,enrichment_groups[[index]] ]
+  enriched.expression$prop.enriched = prop.enriched
+  enriched.expression$cluster = as.character(rownames(enriched.expression))
+  
+  ScatterPlot(enriched.expression, 
+              x = "prop.enriched", 
+              y = markers[[index]], 
+              ylab = paste0(markers[[index]], " expression"), 
+              xlab = paste0("Proportion from ", enrichment_groups[[index]], " samples"), 
+              label = "cluster")
+})
+```
+
+If not enriched, denote proportion enriched to all zero
+
+```{r, eval = !ENRICHED}
+prop.enriched = rep(0, length(unique(speciesAC$seurat_clusters)))
+if(params$species == "Zebrafish") prop.enriched = rep(1, length(unique(speciesAC$seurat_clusters)))
+```
+
+# Regional enrichment for primates
+
+Identify cell types with different proportions in fovea or periphery (only in unenriched samples)
+
+```{r, fig.width=15, fig.height=6}
+if(params$species %in% c("Human", "Macaque", "Marmoset")){
+  plotBatches2(speciesAC, batch = "region", clusters = "type")
+}
+
+# barplot((table(temp$region, temp$type)/rowSums(table(temp$region, temp$type))), beside=T, las = 2, legend = TRUE)
+```
+
+# Find DE markers
+
+```{r, eval = DE_EXPRESSION}
+# Using faster Rcpp implementation provided through presto 
+speciesACmarkers = wilcoxauc(speciesAC, 'seurat_clusters')
+saveRDS(speciesACmarkers, markers_filepath)
+```
+
+## Peptide annotation
+
+```{r}
+neuropeptides = read.table("../../data/complete_neuropeptide_symbols.txt")$V1
+speciesACmarkers = readRDS(markers_filepath)
+
+padj.threshold = 0.001
+logFC.threshold = 1
+
+peptide_markers = lapply(sort(unique(speciesAC$seurat_clusters)), function(cluster){
+                    markers = subset(speciesACmarkers, group == cluster & 
+                             logFC > logFC.threshold & 
+                             padj < padj.threshold)$feature
+                    return(markers[markers %in% toupper(neuropeptides)])
+                  })
+names(peptide_markers) = sort(unique(speciesAC$seurat_clusters))
+peptides_found = sort(unique(unlist(peptide_markers)))
+```
+
+Neuropeptide genes from HUGO (http://www.neuropeptides.nl/tabel%20neuropeptides%20linked.htm)
+
+```{r, fig.height=10, fig.width=15}
+if(length(peptides_found) > 0) {
+  # ClusteredDotplot(speciesAC, dendrogram = phylogram::as.dendrogram(speciesAC@tools$BuildClusterTree), features = peptides_found)
+  DotPlot(speciesAC, group.by = "ac.order", features = peptides_found) + coord_flip()
+}
+```
+
+# Summarize annotations
+
+```{r}
+species_anno = SeuratAnnotation(speciesAC, peptide.list = peptide_markers)
+                                # prop.enriched = prop.enriched)
+species_anno
+saveRDS(species_anno, annotation_filepath)
+```
+
+Save final annotated object
+
+```{r, eval = SAVE}
+saveRDS(speciesAC, final_filepath)
+```
+
+```{r}
+sessionInfo()
+```
+

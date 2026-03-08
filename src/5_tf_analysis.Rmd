@@ -1,0 +1,2138 @@
+---
+title: "TF tree analysis"
+output: 
+  BiocStyle::html_document:
+    toc: true
+params:
+  nIter: 10
+  metadata: TRUE
+  save: TRUE
+---
+
+Load necessary libraries for analysis
+
+```{r setup}
+knitr::opts_chunk$set(dev = 'png', dpi = 300, fig.height = 10, fig.width = 10, 
+                      root.dir = '/clusterfs/kslab/Evolution/paper_2/projects/AC') # set output device to svg
+
+source("../../utils/dario_functions.R")
+LoadLibraries(load.lisi = FALSE)
+SourceFiles()
+
+# Global variables
+NCLUSTERS = 42
+type_cols = AcPalette2(42) %>% setNames(1:NCLUSTERS)
+speciesList = names(SPECIESFILES)
+speciesList.no.gf = setdiff(names(SPECIESFILES), 'Goldfish')
+speciesList.liz = setdiff(speciesList.no.gf, c('Zebrafish', 'Lamprey')) %>% setNames(setdiff(speciesList.no.gf, c('Zebrafish', 'Lamprey')))
+JACCARD.CUTOFF = 0.25
+KNOWNTYPES = c('SAC', 'A2', 'VG3') %>% setNames(c('SAC', 'A2', 'VG3'))
+
+# Global files
+neuropeptides = read.table("../../reference_files/complete_neuropeptide_symbols.txt")$V1
+hk_genes = read.table("../../reference_files/Eisenberg_Cell_2013_hk_genes.txt")$V1
+tf_genes = read.csv("../../reference_files/cisbp_20220920.csv")$Name
+
+# Feature plot colors
+fcols = c('grey', 'deeppink3')
+
+# Palettes
+major_annotation_palette = c(unique(Colors(major_annotation_pr_gaba_gly)) %>% setNames(unique(Annotation(major_annotation_pr_gaba_gly))), 'Other' = 'grey')
+major_annotation_palette2 = c(unique(Colors(major_annotation_pr_gaba_gly_on_off)) %>% setNames(unique(Annotation(major_annotation_pr_gaba_gly_on_off))), 'Other' = 'grey')
+CELL_CLASSES = setdiff(names(major_annotation_palette), 'Other') %>% 
+  setNames(setdiff(names(major_annotation_palette), 'Other'))
+CELL_CLASSES2 = setdiff(names(major_annotation_palette2), 'Other') %>% 
+  setNames(setdiff(names(major_annotation_palette2), 'Other'))
+
+prefix.key = c(ch = "Chicken", li = "Lizard", ze = "Zebrafish", kf = 'Killifish', mf = 'Macaque', mm = 'Mouse', op = 'Opossum')
+NM_SPECIES = c('Chicken', 'Lizard', 'Zebrafish', 'Killifish') %>% setNames(c('Chicken', 'Lizard', 'Zebrafish', 'Killifish'))
+nm_palette = species_palette2[NM_SPECIES]
+nm_palette2 = nm_palette %>% setNames(prefix.key[match(names(nm_palette), prefix.key)])
+
+ac.ortho = LoadACOrtho()
+dend_custom_order = readRDS('../../Ortho_Objects/ac.dendrogram.v2.rds')
+# plot(dend_custom_order)
+clusters <- cutree(as.hclust(dend_custom_order), k = 10)
+type_cols2.no = colorspace::lighten(ClusterPalette(sort(clusters), colors = c('deeppink', 'cyan', 'orange', 'gold', 'chartreuse', '#584B9FFF', 'blue', 'violet', 'tan', 'antiquewhite', 'brown'), vary.by = 0.4), 0.2)
+names(type_cols2.no) = as.numeric(names(sort(clusters))) + 1
+type_cols2.no = type_cols2.no[order(as.numeric(names(type_cols2.no)))]
+type_cols2 = type_cols2.no %>% setNames(levels(ac.ortho$type_unordered))
+# type_cols3 = AcPalette3(42, vary.by = 0.9) %>% setNames(levels(ac.ortho$type))
+# type_cols3.no = type_cols3 %>% setNames(Metadata(ac.ortho, 'type', 'type_no')$type_no)
+# type_cols3.no[names(type_cols3.no) == '20'] = 'tan'
+# type_cols3.no = type_cols3 %>% setNames(1:42)
+
+METHODS = c('UPGMA', 'NJ', 'MP', 'ML')
+```
+
+# Set up
+
+```{r}
+ac.ortho = readRDS("../../Ortho_Objects/vertebrateAC_BIGSEURAT.rds")
+```
+
+Steps:
+
+* Select top conserved TFs
+* Binarize expression so that each OT is a vector of 1s and 0s of length nTFs
+* Compute maximum parsimony tree using Phangorn
+* Understand tree logic
+
+## Feature selection
+
+```{r, fig.height=4, fig.width=5}
+conservation.summary = readRDS("../../Ortho_Objects/vertebrateAC_conservation_v2.rds")
+# conservation.summary$is.tf = conservation.summary$gene %in% tf_genes
+cor.score.cutoff = 0.3 #max(conservation.summary$cor.score.rand, na.rm = TRUE)
+PrettyHistogram(subset(conservation.summary, is.tf)$cor.score, 
+                vline = cor.score.cutoff, 
+                xlab = "Conservation score", 
+                title = paste0("Conservation scores for ", nrow(subset(conservation.summary, is.tf)), " TFs"))
+PrettyHistogram(sample(conservation.summary$cor.score, nrow(subset(conservation.summary, is.tf))), 
+                vline = cor.score.cutoff, 
+                xlab = "Conservation score", 
+                title = paste0("Conservation scores for ", nrow(subset(conservation.summary, is.tf)), " random genes"))
+
+# Significantly more conserved 
+t.test(cor.score ~ is.tf, conservation.summary)
+```
+
+```{r, fig.height=4, fig.width=9}
+ac.ortho = LoadACOrtho()
+conserved.tfs = subset(conservation.summary %>% arrange(desc(cor.score)), cor.score > cor.score.cutoff & is.tf)
+head(conserved.tfs)
+
+# Examples of highly conserved TFs
+lapply(head(conserved.tfs$gene, 5), function(gene) geneDotPlotFast(ac.ortho, gene, group.by = "type"))
+lapply(tail(conserved.tfs$gene, 5), function(gene) geneDotPlotFast(ac.ortho, gene, group.by = "type"))
+```
+
+## Binarization using k-means
+
+Average expression
+
+```{r, eval = FALSE}
+# Within each species
+features.use = rownames(ac.ortho)
+vertebrateAC.list = SplitObject(ac.ortho, 'species')
+avg.expr.list = lapply(vertebrateAC.list, function(object){
+  print(object)
+  object$seurat_clusters = factor(object$seurat_clusters)
+  LogAvgExpr(object, group = 'seurat_clusters', features = features.use, assay = 'RNA')
+})
+
+# Reshape to be n_gene matrices of size n_species x n_OT
+avg.mat.list = mclapply(features.use, function(feature) {
+  do.call(gtools::smartbind, lapply(avg.expr.list, function(x) data.frame(as.list(x[feature,]))))
+}, mc.cores = 16)
+names(avg.mat.list) = features.use
+
+saveRDS(avg.mat.list, "../../Ortho_Objects/AC_OT_average_expression.rds")
+```
+
+Percentage expressed
+
+```{r, eval = FALSE}
+# Within each species
+features.use = rownames(ac.ortho)
+vertebrateAC.list = SplitObject(ac.ortho, 'species')
+percent.list = lapply(vertebrateAC.list, function(object){
+  
+  print(object)
+  object$seurat_clusters = factor(object$seurat_clusters)
+  
+  # Percentage expressed
+  pct.data = PercentageExpressed2(object, group.by = "seurat_clusters", features = features.use) # was PercentageExpressed
+  
+  return(pct.data)
+})
+
+saveRDS(percent.list, "../../Ortho_Objects/AC_OT_percent_expressed_list.rds")
+
+# Reshape to be n_gene matrices of size n_species x n_OT
+pct.list = mclapply(features.use, function(feature) {
+  do.call(gtools::smartbind, lapply(percent.list, function(x) data.frame(as.list(x[feature,]))))/100 # divide by 100
+}, mc.cores = 16)
+names(pct.list) = features.use
+
+saveRDS(pct.list, "../../Ortho_Objects/AC_OT_percent_expressed.rds")
+```
+
+New method using percentage expression and scaled, log-transformed expression
+
+```{r}
+# matrix.list = readRDS("../../Ortho_Objects/scaled_OT_expression_v4_nonlog.rds")
+
+# Log-transformed and scaled
+matrix.list = readRDS("../../Ortho_Objects/scaled_OT_expression_log.rds")
+
+# Log transformed, not scaled
+# matrix.list = readRDS("../../Ortho_Objects/AC_OT_average_expression.rds")
+
+# rescaled.matrix.list = readRDS("../../Ortho_Objects/RGC_OT_rescaled_expr.rds")
+pct.list = readRDS("../../Ortho_Objects/AC_OT_percent_expressed.rds")
+# score.list = readRDS("../../Ortho_Objects/RGC_OT_expr_score.rds")
+conservation.summary = readRDS("../../Ortho_Objects/vertebrateAC_conservation_v2.rds")
+cor.score.cutoff = 0.3
+```
+
+```{r}
+conserved.genes = subset(conservation.summary %>% arrange(desc(cor.score)), cor.score > cor.score.cutoff)
+k.masks.res = lapply(conserved.genes$gene, function(gene){
+  
+  # Ensure that rows with all zeroes are set to NA to avoid scaling artifacts
+  mat = apply(matrix.list[[gene]], 1, function(row){
+    if(var(row, na.rm = TRUE) == 0) rep(NA, length(row)) else row
+  }) %>% t %>% as.data.frame()
+  
+  bin.res = BinarizeExpressionMV2(gene = gene, 
+                        avg.expr = unlist(mat) %>% as.data.frame %>% setNames(gene) %>% t, 
+                        pct.expr = unlist(pct.list[[gene]]) %>% as.data.frame %>% setNames(gene) %>% t, 
+                        fast = TRUE, 
+                        compute.r.squared = FALSE, 
+                        plot = TRUE, 
+                        nstart = 50)
+  
+  message(paste0(gene, ':', bin.res$r.squared.k))
+  
+  df = as.data.frame(
+    matrix(bin.res$k.vector, 
+         nrow = nrow(matrix.list[[1]]), 
+         ncol = ncol(matrix.list[[1]]))
+    )
+  rownames(df) = speciesList.liz
+  colnames(df) = levels(ac.ortho$type_unordered)
+  list(mat = df, r.squared = bin.res$r.squared.k)
+}) %>% setNames(conserved.genes$gene)
+
+k.masks = lapply(k.masks.res, function(x) x$mat)
+r.squared.list = sapply(k.masks.res, function(x) x$r.squared)
+saveRDS(r.squared.list, 'tf_analysis/r.squared.list.rds')
+PrettyHistogram(r.squared.list, vline = 0.64)
+
+pdf('tf_analysis/ac-gene-dotplots.pdf', height = 5, width = 9)
+lapply(seq_along(k.masks), function(i) {
+  gene = names(k.masks)[[i]]
+  TitlePlot(geneDotPlotFast(ac.ortho, gene = gene, binarization = k.masks[[gene]]), 
+            title = paste0(gene, ' (', round(r.squared.list[[i]], 2), ')'))
+})
+dev.off()
+
+# Flagged TFs that should be removed
+# remove.genes = c('DPF3', 'PAX6', 'FOXN3', 'PEG3', 'CUX1', 'RORA', 'KLF12')
+remove.genes = c() # Filter later on, try toggling the threshold
+
+# Thresholding
+masks = lapply(k.masks, function(full_mask){
+  new = apply(full_mask, 2, mean, na.rm = TRUE)
+  new[new > 0.5] = 1
+  new[new <= 0.5] = 0
+  return(new)
+})
+names(masks) = names(k.masks)
+
+# Remove genes with no variance
+variance = sapply(masks, var) # CUX1 RORA 
+which(variance == 0)
+filtered.masks = masks[!(variance == 0 | names(masks) %in% remove.genes)]
+length(filtered.masks)
+
+# Save
+tf.expr.mask = do.call(rbind, filtered.masks)
+colnames(tf.expr.mask) = gsub('\\*', '', Metadata(ac.ortho, "seurat_clusters", "type")$type)
+saveRDS(tf.expr.mask, "tf_analysis/k.mask.collapsed.rds")
+saveRDS(k.masks, "tf_analysis/k.masks.rds")
+```
+
+# Checkpoint 1
+
+```{r}
+ac.ortho = readRDS("../../Ortho_Objects/vertebrateAC_BIGSEURAT.rds")
+k.masks = readRDS('tf_analysis/k.masks.rds')
+tf.expr.mask = readRDS("tf_analysis/k.mask.collapsed.rds")
+r.squared.list = readRDS('tf_analysis/r.squared.list.rds')
+tfs.use = intersect(tf_genes, names(which(r.squared.list > 0.65)))
+```
+
+# TF code
+
+We need a nTF-dimensional binary vector for each OT in each OT. Final output: OT x TF matrix
+
+```{r, fig.height=60, fig.width=8}
+Heatmap((tf.expr.mask), 
+        rect_gp = gpar(col = "black", lwd = 1),
+        border_gp = gpar(col = "black", lwd = 1),
+        col = c("lightgrey", "#584B9FFF"), 
+        show_row_dend = TRUE, 
+        show_column_dend = TRUE, 
+        clustering_distance_rows = "manhattan", 
+        clustering_method_rows = "average", 
+        clustering_distance_columns = "manhattan", 
+        clustering_method_columns = "average", 
+        show_heatmap_legend = FALSE)
+```
+
+```{r, fig.width=30, fig.height=10}
+Heatmap(t(tf.expr.mask), 
+        rect_gp = gpar(col = "black", lwd = 1),
+        border_gp = gpar(col = "black", lwd = 1),
+        col = c("lightgrey", "#584B9FFF"), 
+        show_row_dend = TRUE, 
+        show_column_dend = TRUE, 
+        clustering_distance_rows = "binary", 
+        clustering_method_rows = "average", 
+        clustering_distance_columns = "binary", 
+        clustering_method_columns = "average", 
+        show_heatmap_legend = FALSE)
+```
+
+# Hierarchical trees with pvclust
+
+```{r, fig.height=6, fig.width=20}
+library(pvclust)
+result.man <- pvclust(tf.expr.mask, method.hclust = "average", method.dist = "manhattan", nboot = 1000)
+plot(result.man)
+mean(result.man$edges[,'au'])
+```
+
+```{r, fig.height=6, fig.width=20}
+library(pvclust)
+result.bin <- pvclust(tf.expr.mask, method.hclust = "average", method.dist = "binary", nboot = 1000)
+plot(result.bin)
+mean(result.bin$edges[,'au'])
+```
+
+
+```{r}
+library(dendextend)
+dnd1 <- as.dendrogram(result.man$hclust)
+dnd2 <- as.dendrogram(result.bin$hclust)
+## rearrange in ladderized fashion
+# dnd1 <- ladder(dnd1)
+# dnd2 <- ladder(dnd2)
+## plot the tanglegram
+dndlist <- dendextend::dendlist(dnd1, dnd2)
+dndlist %>% entanglement
+dndlist %>% untangle(method = "step1side") %>% entanglement
+dendextend::tanglegram(dndlist %>% untangle(method = "step1side"), 
+                       fast = TRUE, 
+                       margin_inner = 5, 
+                       main_left = "all species NJ", 
+                       main_right = "all species MP")
+```
+
+Metrics: 
+
+* Species consistency: similarity to species trees
+* Self consistency: robustnesss to gene removal 
+* Cross-method compatibility: compared to other method
+
+Parameters:
+
+* Method (4): NJ and MP seem more robust than UPGMA and ML
+* Choice of genes (2): TFs seem more robust than non-TFs
+* Gene cutoff
+
+8 combinations
+
+# Species consistency
+
+```{r}
+# Filtration
+PrettyHistogram(r.squared.list, vline = c(0.55, 0.61, 0.64), fill = 'grey')
+# features.use = names(which(r.squared.list > 0.61))
+# features.use = names(which(r.squared.list > 0.64))
+
+# Conserved genes with high R^2
+features.use = names(which(r.squared.list > 0.7))
+
+# Conserved TFs
+features.use = intersect(tf_genes, names(which(r.squared.list > 0.65)))
+
+# Make binarization within each species
+species.mats = lapply(speciesList.liz, function(species){
+  df = do.call(rbind, lapply(k.masks, function(mask) mask[species,]))
+  colnames(df) = gsub('\\*', '', colnames(df))
+  df
+})
+
+# Remove rows with all NAs (missing gene) and columns with all NAs (missing type)
+species.mats.clean = lapply(species.mats, function(mat) {
+  mat[!apply(mat, 1, function(x) all(is.na(x))),!apply(mat, 2, function(x) all(is.na(x)))]
+}) 
+
+# Check that NAs have been removed
+stopifnot(all(!sapply(species.mats.clean, function(x) any(is.na(x)))))
+```
+
+```{r, fig.width=12, fig.height=10}
+# Compute species trees
+species.trees = lapply(species.mats.clean, function(mat){
+  mat = mat[intersect(features.use, rownames(mat)),]
+  ConstructTrees(t(mat), nIter = 100, mc.cores = 1, bootstrap = FALSE)
+}) 
+
+# With collapsed data
+col.trees = ConstructTrees(t(tf.expr.mask[features.use,]), nIter = 100, mc.cores = 1, bootstrap = FALSE)
+
+# Hierarchical clustering tree
+h.tree = ape::as.phylo(as.hclust(readRDS('../../Ortho_Objects/ac.dendrogram.v2.rds')))
+h.tree$tip.label = gsub('\\*', '', levels(ac.ortho$type_unordered))
+
+# Robinson Foulds distances
+# all.trees = c(unlist(species.trees, recursive = FALSE), col = col.trees, hc = list(h.tree))
+all.trees = c(species.trees, all = list(col.trees))# hc = list(h.tree))
+
+rf.mat = Iterate(c(
+    upgma = lapply(all.trees, function(x) x$UPGMA),
+    nj = lapply(all.trees, function(x) x$NJ),
+    mp = lapply(all.trees, function(x) x$MP),
+    ml = lapply(all.trees, function(x) x$ML),
+    hc = list(h.tree)
+  ), function(x, y) {
+    tryCatch({
+      tips.remove = union(setdiff(x$tip.label, y$tip.label), setdiff(y$tip.label, x$tip.label))
+      print(tips.remove)
+      x = drop.tip(x, tip = tips.remove)
+      y = drop.tip(y, tip = tips.remove)
+      RF.dist(x, y, normalize = TRUE)
+  }, error = function(e) {
+      # Print the error message to the console
+      message("An error occurred: ", conditionMessage(e))
+      browser()
+  })
+})
+
+Heatmap2(rf.mat, 
+         top_anno = HeatmapAnnotation(`Marginal\nRFD` = anno_barplot(min_max_norm(colMedians(rf.mat, na.rm = T)))), 
+         legend.name = 'Robinson-\nFoulds\ndistance')
+```
+
+
+```{r, fig.height=10, fig.width=10}
+saveRDS(all.trees, 'tf_analysis/all.trees.v2.rds')
+```
+
+# Compare trees
+
+```{r, fig.height=20, fig.width=20}
+library(phylogram)
+library(ape)
+
+# all.trees$col$NJ$node.label = all.trees$col$MP$node.label
+
+plot(all.trees$all$UPGMA, type = 'unrooted', show.node.label = TRUE)
+nodelabels(1:Nnode(all.trees$all$UPGMA) + 42)
+plot(all.trees$all$NJ, type = 'unrooted', show.node.label = TRUE) # 60, 70
+nodelabels(1:Nnode(all.trees$all$NJ) + 42)
+plot(all.trees$all$MP, type = 'unrooted', show.node.label = TRUE) # 68, 47
+# nodelabels(1:Nnode(all.trees$col$MP))
+plot(all.trees$all$ML, type = 'unrooted', show.node.label = TRUE)
+# nodelabels(1:Nnode(all.trees$col$ML))
+```
+
+```{r, fig.height=10, fig.width=10}
+all.trees = readRDS('tf_analysis/all.trees.v2.rds')
+CompareTrees(all.trees$all$NJ, all.trees$all$MP, 'NJ', 'MP')
+CompareTrees(all.trees$all$UPGMA, all.trees$all$NJ, 'UPGMA', 'NJ')
+CompareTrees(all.trees$all$MP, all.trees$all$ML, 'MP', 'ML')
+```
+
+# TFs versus non-TFs
+
+```{r, fig.height=2, fig.width=4}
+# Maximum parsimony tree with 70 conserved TFs
+tfs.use = intersect(tf_genes, names(which(r.squared.list > 0.65)))
+tf.trees = ConstructTrees(t(tf.expr.mask[tfs.use,]), nIter = 100, mc.cores = 10, bootstrap = TRUE)
+tf.bs = tf.trees$MP$bs.support
+saveRDS(tf.trees, 'tf_analysis/tf.trees.rds')
+
+# Non-tfs
+nontf.trees.list = lapply(seq_len(100), function(i){
+  nontfs.use = sample(setdiff(names(which(r.squared.list > 0.65)), tf_genes), size = length(tfs.use))
+  ConstructTrees(t(tf.expr.mask[nontfs.use,]), nIter = 100, mc.cores = 10, bootstrap = TRUE)
+})
+saveRDS(nontf.trees.list, 'tf_analysis/nontf.trees.list.rds')
+
+# Get bs values
+bs.values = unlist(sapply(nontf.trees.list, function(x) x$MP$bs.support))
+mean.bs = unlist(sapply(nontf.trees.list, function(x) mean(x$MP$bs.support)))
+PrettyHistogram(mean.bs, vline = mean(tf.bs), xlab = 'Mean bootstrap support')
+
+t.test(tf.bs, bs.values)
+wilcox.test(tf.bs, nontf.bs)
+```
+
+```{r, fig.height=10, fig.width=10}
+plot(tf.trees$MP, type = 'unrooted')
+plot(tf.trees$MP)
+```
+
+TFs lead to more robust trees than comparable sets of non-TFs. 
+
+```{r}
+boxplot(tf.trees$UPGMA$bs.support, tf.trees$NJ$bs.support, tf.trees$MP$bs.support)
+boxplot(unlist(lapply(nontf.trees.list, function(x) x$UPGMA$bs.support)), 
+        unlist(lapply(nontf.trees.list, function(x) x$NJ$bs.support)), 
+        unlist(lapply(nontf.trees.list, function(x) x$MP$bs.support)))
+```
+
+Robinson foulds distance to all the bootstrap trees
+
+```{r}
+bs.tf.trees = BootstrapTrees(t(tf.expr.mask[tfs.use,]), mc.cores = 10)
+nontfs.use = sample(setdiff(names(which(r.squared.list > 0.65)), tf_genes), size = length(tfs.use))
+bs.nontf.trees = BootstrapTrees(t(tf.expr.mask[nontfs.use,]), mc.cores = 10)
+```
+
+```{r, fig.height=5, fig.width=3}
+Heatmap2(data.frame(UPGMA = sapply(bs.tf.trees$UPGMA, function(this) RF.dist(tf.trees$UPGMA, this, normalize = TRUE)), 
+                NJ = sapply(bs.tf.trees$NJ, function(this) RF.dist(tf.trees$NJ, this, normalize = TRUE)), 
+                MP = sapply(bs.tf.trees$MP, function(this) RF.dist(tf.trees$MP, this, normalize = TRUE))), 
+         col = colorRamp2(c(0.4,1), c('white', 'red')))
+
+Heatmap2(data.frame(UPGMA = sapply(bs.nontf.trees$UPGMA, function(this) RF.dist(tf.trees$UPGMA, this, normalize = TRUE)), 
+                NJ = sapply(bs.nontf.trees$NJ, function(this) RF.dist(tf.trees$NJ, this, normalize = TRUE)), 
+                MP = sapply(bs.nontf.trees$MP, function(this) RF.dist(tf.trees$MP, this, normalize = TRUE))), 
+         col = colorRamp2(c(0.4,1), c('white', 'red')))
+
+
+```
+
+# Cross method compatibility
+
+```{r}
+# Randomly sample some TFs, calculate trees, and check similarity
+resampled.tf.trees = mclapply(seq_len(params$nIter), function(i){
+  genes.use = sample(tfs.use, size = length(tfs.use)-5)
+  ConstructTrees(t(tf.expr.mask[genes.use,]), bootstrap = FALSE, minit = 100)
+}, mc.cores = 1)
+
+resampled.tf.trees
+```
+```{r}
+rf.mat = Iterate(c(
+    upgma = lapply(resampled.tf.trees, function(x) x$UPGMA),
+    nj = lapply(resampled.tf.trees, function(x) x$NJ),
+    mp = lapply(resampled.tf.trees, function(x) x$MP),
+    ml = lapply(resampled.tf.trees, function(x) x$ML)
+  ), function(x, y) {
+      tryCatch({
+      tips.remove = union(setdiff(x$tip.label, y$tip.label), setdiff(y$tip.label, x$tip.label))
+      print(tips.remove)
+      x = drop.tip(x, tip = tips.remove)
+      y = drop.tip(y, tip = tips.remove)
+      RF.dist(x, y, normalize = TRUE)
+  }, error = function(e) {
+      # Print the error message to the console
+      message("An error occurred: ", conditionMessage(e))
+      browser()
+  })
+})
+
+colnames(rf.mat) = sub("(\\d)", "\\.\\1", colnames(rf.mat))
+rownames(rf.mat) = sub("(\\d)", "\\.\\1", rownames(rf.mat))
+rf.mat = MakeSmartMatrix(rf.mat, delimiter.row = '\\.', delimiter.col = '\\.')
+
+Heatmap2(rf.mat@matrix, 
+         top_anno = HeatmapAnnotation(`Marginal\nRFD` = anno_barplot(min_max_norm(matrixStats::colMedians(rf.mat@matrix, na.rm = T)))), 
+         legend.name = 'Robinson-\nFoulds\ndistance')
+```
+
+mp2 is more robust than mp1
+
+```{r}
+CompareTrees(resampled.tf.trees[[1]]$MP, resampled.tf.trees[[2]]$MP)
+CompareTrees(tf.trees$MP, resampled.tf.trees[[2]]$MP)
+CompareTrees(resampled.tf.trees[[1]]$MP, tf.trees$MP)
+```
+
+# Monophyletic genes
+
+```{r}
+mono.res = lapply(tf.trees[METHODS], function(tree) {
+  names(which((apply(tf.expr.mask, 1, function(row){
+    is.monophyletic(tree, names(which(row > 0)))
+  }))))
+})
+mono.res
+
+library(UpSetR)
+upset(fromList(mono.res),
+                    # A few optional arguments to customize the plot:
+                    nsets = 5,                 # The number of sets to display
+                    nintersects = 20,          # The number of intersections to display
+                    mainbar.y.label = "Intersection Size",   # Label for the main bar chart
+                    sets.x.label = "Set Size", # Label for the set size bar chart
+                    text.scale = c(1.5, 1.3, 1, 1, 2, 1.2), # Adjust font sizes
+                    point.size = 2.5,
+                    line.size = 1)
+```
+
+Visualize monophyletic
+
+```{r, fig.height=8, fig.width=10}
+Heatmap(t(tf.expr.mask[mono.res$MP,]), 
+        rect_gp = gpar(col = "black", lwd = 1),
+        border_gp = gpar(col = "black", lwd = 1),
+        col = c("lightgrey", "#584B9FFF"), 
+        show_row_dend = TRUE, 
+        show_column_dend = TRUE, 
+        clustering_distance_rows = "binary", 
+        clustering_method_rows = "average", 
+        clustering_distance_columns = "binary", 
+        clustering_method_columns = "average", 
+        show_heatmap_legend = FALSE)
+```
+
+Most are trivially monophyletic
+
+# Visualize tree with gene expression
+
+```{r, fig.width=15, fig.height=8}
+lapply(tf.trees[METHODS], function(tree){
+  Heatmap(t(tf.expr.mask[,tree$tip.label]), 
+        # rect_gp = gpar(col = "black", lwd = 1),
+        border_gp = gpar(col = "black", lwd = 1),
+        col = c("lightgrey", "#584B9FFF"), 
+        show_row_dend = TRUE, 
+        show_column_dend = TRUE, 
+        cluster_rows = as.dendrogram.phylo(midpoint(tree)), 
+        clustering_distance_columns = "binary", 
+        clustering_method_columns = "average", 
+        show_heatmap_legend = FALSE)
+})
+```
+
+
+```{r}
+plot(tf.trees$ML)
+```
+
+Plot TFs and adhesion molecules
+
+```{r, fig.height=6, fig.width=10}
+lapply(tf.trees[METHODS], function(tree){
+  Heatmap(t(tf.expr.mask[tfs.use,tree$tip.label]), 
+        # rect_gp = gpar(col = "black", lwd = 1),
+        border_gp = gpar(col = "black", lwd = 1),
+        col = c("lightgrey", "#584B9FFF"), 
+        show_row_dend = TRUE, 
+        show_column_dend = TRUE, 
+        cluster_rows = as.dendrogram.phylo(midpoint(tree)), 
+        clustering_distance_columns = "binary", 
+        clustering_method_columns = "average", 
+        show_heatmap_legend = FALSE)
+})
+```
+
+
+
+```{r, fig.height=6, fig.width=6}
+gene.lists = readRDS('../../reference_files/gene-lists-ac.rds')
+
+adhesion.use = intersect(gene.lists$adhesion, names(which(r.squared.list > 0.60)))
+lapply(tf.trees[METHODS], function(tree){
+  Heatmap(t(tf.expr.mask[adhesion.use,tree$tip.label]), 
+        # rect_gp = gpar(col = "black", lwd = 1),
+        border_gp = gpar(col = "black", lwd = 1),
+        col = c("lightgrey", "#584B9FFF"), 
+        show_row_dend = TRUE, 
+        show_column_dend = TRUE, 
+        cluster_rows = as.dendrogram.phylo(midpoint(tree)), 
+        clustering_distance_columns = "binary", 
+        clustering_method_columns = "average", 
+        show_heatmap_legend = FALSE)
+})
+```
+
+# More plots
+
+```{r, fig.height=12, fig.width=8}
+ac.ortho$type_clean = factor(gsub('\\*', '', ac.ortho$type_unordered), 
+                             levels = gsub('\\*', '', levels(ac.ortho$type_unordered)))
+
+genes.omit = c('HLF', 'RORB', 'ZFPM2', 'ZNF503', 'FOXP1', 'DACH1', 'CUX2', 'KLF7', 'ZNF488', 'NR2F2', 'NR2F1', 
+               'PBX1', 'ZNF521', 'POU3F3', 'ZBTB18', 'FEZF1', 'FOXN2', 
+               'GBX2', 'FEZF2', 'ZNF536', 'BNC1', 'NR1H4', 'ONECUT1', 'TFAP2E', 'EOMES', 'SOX5', 'ESRRG', 'BCL11B')
+
+single.type.genes = c('NR1H4', 'ONECUT1', 'EOMES', 'SOX2', 'ISL1', 'GBX2')
+
+family.genes = setdiff(setdiff(c(tfs.use, 'TFAP2A'), genes.omit), single.type.genes)
+clust = hclust(dist(tf.expr.mask[family.genes,], method = 'binary'))
+family.genes.ordered = clust$labels[clust$order]
+
+# Family-defining TFs
+ClusteredDotplot2(ac.ortho, 
+                  features = family.genes.ordered, 
+                  group.by = 'type_clean', 
+                  cluster_columns = midpoint(tf.trees$MP),
+                  max.pct = 40, 
+                  dot.scale.factor = 0.5, 
+                  pseudocount = 5, 
+                  rotate = FALSE, 
+                  show_row_dend = FALSE)
+
+# Type-defining TFs
+```
+
+
+```{r, fig.height=6, fig.width=8.5}
+# Rotate
+dend = as.dendrogram.phylo(midpoint(tf.trees$MP))
+tf.trees$MP2 = dendextend::rotate(dend, order = c("26_A8", "24_SEG", "2_NNgly", "34", "17_ROBO3", "15", "18_TRHDE", "27_VG3", "41_TRHDE", "22_A2", "21_PDGFRA", "28", "1_MAF", "3", "9", "20", "6_NPY", "13", "40", "8_SAC", "42", "38", "14_CA2", "16_NNgaba", "4_nNOS", "31_nNOS", "10_MAF", "23_RXRG", "39", "35", "7", "33_CA1", "11", "25", "12_nNOS", "19_CRH", "30_A17", "32_A17", "29_SLC35D3", "5", "36_VIP", "37"))
+
+ClusteredDotplot2(ac.ortho, 
+                  features = family.genes.ordered, 
+                  group.by = 'type_clean', 
+                  cluster_rows = tf.trees$MP2,
+                  max.pct = 40, 
+                  dot.scale.factor = 0.3, 
+                  pseudocount = 5, 
+                  rotate = TRUE)
+```
+
+
+```{r, fig.height=6, fig.width=5}
+adhesion.use = intersect(gene.lists$adhesion, names(which(r.squared.list > 0.60)))
+ClusteredDotplot2(ac.ortho, 
+                  features = adhesion.use, 
+                  group.by = 'type_clean', 
+                  cluster_rows = tf.trees$MP2,
+                  cluster_columns = TRUE,
+                  max.pct = 40, 
+                  dot.scale.factor = 0.3, 
+                  pseudocount = 5, 
+                  rotate = TRUE)
+
+adhesion.genes = c('UNC5D', 'CLMP', 'CDH7', 'DSCAM', 'CDH10', 'CDH8', 'CDH4', 'PCDH10', 'IGSF11', 'DSCAML1', 'CDH22', 'TENM3')
+ClusteredDotplot2(ac.ortho, 
+                  features = adhesion.genes, 
+                  group.by = 'type_clean', 
+                  cluster_rows = tf.trees$MP2,
+                  cluster_columns = TRUE,
+                  max.pct = 40, 
+                  dot.scale.factor = 0.3, 
+                  pseudocount = 5, 
+                  rotate = TRUE)
+```
+
+# Explore the tree space
+
+```{r, fig.width=10, fig.height=10}
+set.seed(42)
+phydat = BinaryPhyDat(t(tf.expr.mask[tfs.use,]))
+treeMPs <- pratchet(phydat, trace = 0, minit = 1000, all = TRUE)
+
+# Add branch lengths (will be needed for consensus branch lengths)
+treeMPs = lapply(treeMPs, function(tree){
+  tree = acctran(tree, phydat)
+  di2multi(tree, tol = 0)
+})
+plot(treeMPs[[1]])
+
+# Consensus tree
+ctree = consensus(treeMPs, p = 0.5, check.labels = TRUE)
+plot(ctree)
+saveRDS(ctree, 'tf_analysis/ctree.rds')
+ctree_bl <- phytools::consensus.edges(treeMPs, method = "mean.edge", consensus.tree = ctree)
+plot(ctree_bl)
+saveRDS(ctree_bl, 'tf_analysis/ctree_bl.rds')
+
+# Show that the consensus tree is particularly robust
+
+# 132 equivalent trees
+# nni.matrix = treeMPs
+
+ctree2  <- acctran(ctree, phydat)
+ctree2  <- di2multi(ctree2, tol = 0)
+plot(ctree2)
+saveRDS(ctree2, 'tf_analysis/ctree2.rds')
+```
+
+
+```{r, fig.width=10, fig.height=10}
+CompareTrees(ctree2, tf.trees$NJ)
+```
+
+What is robust? 
+* 22, 41, 27, 18, 15, 17, 34, 2, 26, 24
+* 33,7
+* 8, 42
+* 21, 28, 36, 5, 37
+* 1,3,9,20,23,39
+* 12, 11, 25, 19, 32, 30
+* 40, 13, 6
+* 16, 14, 4, 31
+
+Unclear: 
+29, 35, 38, 10
+
+```{r, fig.height=10, fig.width=10}
+plotBS(ctree, as.multiPhylo(treeMPs)) # all > 0.5
+```
+
+# How many genes to include (when does robustness saturate?)
+
+```{r}
+loo.trees.list = lapply(c(5,10,20,40,70), function(nTFs) LOOTrees(t(tf.expr.mask[tfs.use[1:nTFs],]), consensus = TRUE))
+loo.trees = lapply(c(40), function(nTFs) LOOTrees(t(tf.expr.mask[tfs.use[1:nTFs],]), consensus = TRUE))
+loo.trees.list[[4]] = loo.trees[[1]]
+RFMatrix(loo.trees.list[[1]])
+RFMatrix(loo.trees.list[[2]])
+RFMatrix(loo.trees.list[[3]])
+RFMatrix(loo.trees.list[[4]])
+saveRDS(loo.trees.list, 'tf_analysis/loo.trees.list.rds')
+```
+
+# Robustness diagram (using LOO trees)
+
+```{r}
+# loo.trees = LOOTrees(t(tf.expr.mask[tfs.use[1:5],]), consensus = TRUE)
+
+# Check if clade is monophyletic
+
+clades <- list(
+  c(22, 41, 27, 18, 15, 17, 34, 2, 26, 24), # gly
+  c(33, 7), # CA1
+  c(8, 42), # SAC
+  c(21, 28), # PDGFRA
+  c(36, 5, 37), # VIP
+  c(1, 3, 9, 20), # MAF
+  c(23, 39),
+  c(12, 11, 25, 19, 32, 30), # CRH
+  c(40, 13, 6), # NPY
+  c(16, 14, 4, 31), # CA2
+  c(29, 35, 38, 10) # not robust
+)
+clades = lapply(clades, as.character)
+names(clades) = 1:length(clades)
+
+# Binary presence doesn't capture some cases
+robust.res = rbind(
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+  sapply(clades, function(clade){
+    tree = this$UPGMA
+    tree$tip.label = ExtractString(tree$tip.label, after = '_')
+    is.monophyletic(tree, tips = as.character(clade))
+  })
+})), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+    sapply(clades, function(clade){
+      tree = this$NJ
+      tree$tip.label = ExtractString(tree$tip.label, after = '_')
+      is.monophyletic(tree, tips = as.character(clade))
+    })
+  })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+      sapply(clades, function(clade){
+        tree = this$MP
+        tree$tip.label = ExtractString(tree$tip.label, after = '_')
+        is.monophyletic(tree, tips = as.character(clade))
+      })
+    })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+        sapply(clades, function(clade){
+          tree = this$ML
+          tree$tip.label = ExtractString(tree$tip.label, after = '_')
+          is.monophyletic(tree, tips = as.character(clade))
+        })
+    }))
+)
+
+Heatmap2(t(apply(robust.res, 1, as.numeric)))
+saveRDS(robust.res, 'tf_analysis/robust.res.binary.rds')
+```
+
+Clades broad
+
+```{r}
+# loo.trees = LOOTrees(t(tf.expr.mask[tfs.use[1:5],]), consensus = TRUE)
+
+# Check if clade is monophyletic
+
+clades.broad <- list(
+  c(22, 41, 27, 18, 15, 17, 34, 2, 26, 24), # gly
+  c(21, 28), # PDGFRA
+  c(36, 5, 37), # VIP
+  c(1, 3, 9, 20, 23, 39, 33, 7, 8, 42, 40, 13, 6, 16, 14, 4, 31, 10, 35, 38), # gaba
+  c(12, 11, 25, 19, 32, 30), # CRH
+  c(29) # not robust
+)
+clades.broad = lapply(clades.broad, as.character)
+names(clades.broad) = 1:length(clades.broad)
+
+# Binary presence doesn't capture some cases
+robust.res = rbind(
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+  sapply(clades.broad, function(clade){
+    tree = this$UPGMA
+    tree$tip.label = ExtractString(tree$tip.label, after = '_')
+    is.monophyletic(tree, tips = as.character(clade))
+  })
+})), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+    sapply(clades.broad, function(clade){
+      tree = this$NJ
+      tree$tip.label = ExtractString(tree$tip.label, after = '_')
+      is.monophyletic(tree, tips = as.character(clade))
+    })
+  })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+      sapply(clades.broad, function(clade){
+        tree = this$MP
+        tree$tip.label = ExtractString(tree$tip.label, after = '_')
+        is.monophyletic(tree, tips = as.character(clade))
+      })
+    })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+        sapply(clades.broad, function(clade){
+          tree = this$ML
+          tree$tip.label = ExtractString(tree$tip.label, after = '_')
+          is.monophyletic(tree, tips = as.character(clade))
+        })
+    }))
+)
+
+Heatmap2(t(apply(robust.res, 1, as.numeric)))
+saveRDS(robust.res, 'tf_analysis/robust.res.binary.broad.rds')
+```
+
+Nearest neighbors
+
+```{r}
+
+# Binary presence doesn't capture some cases
+robust.res.nn = rbind(
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+    sapply(clades, function(clade){
+      tree = this$UPGMA
+      tree$tip.label = ExtractString(tree$tip.label, after = '_')
+      are.neighbors(cophenetic(tree), nodes = as.character(clade), binary = FALSE)
+    })
+})), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+    sapply(clades, function(clade){
+      tree = this$NJ
+      tree$tip.label = ExtractString(tree$tip.label, after = '_')
+      are.neighbors(cophenetic(tree), nodes = as.character(clade), binary = FALSE)
+    })
+  })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+      sapply(clades, function(clade){
+        tree = this$MP
+        tree$tip.label = ExtractString(tree$tip.label, after = '_')
+        are.neighbors(cophenetic(tree), nodes = as.character(clade), binary = FALSE)
+      })
+    })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+      sapply(clades, function(clade){
+        tree = this$ML
+        tree$tip.label = ExtractString(tree$tip.label, after = '_')
+        are.neighbors(cophenetic(tree), nodes = as.character(clade), binary = FALSE)
+      })
+    }))
+)
+
+Heatmap2(t(apply(robust.res.nn, 1, as.numeric)))
+saveRDS(robust.res, 'tf_analysis/robust.res.nn.rds')
+```
+
+Normalized Average Within-Cluster Distance
+
+```{r}
+robust.res.dist = rbind(
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+    sapply(clades, function(clade){
+      tree = this$UPGMA
+      tree$tip.label = ExtractString(tree$tip.label, after = '_')
+      calculate_normalized_distance(cophenetic(tree), clade)/sum(tree$edge.length)
+    })
+  })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+    sapply(clades, function(clade){
+      tree = this$NJ
+      tree$tip.label = ExtractString(tree$tip.label, after = '_')
+      calculate_normalized_distance(cophenetic(tree), clade)/sum(tree$edge.length)
+    })
+  })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+    sapply(clades, function(clade){
+      tree = this$MP
+      tree$tip.label = ExtractString(tree$tip.label, after = '_')
+      calculate_normalized_distance(cophenetic(tree), clade)/sum(tree$edge.length)
+    })
+  })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+    sapply(clades, function(clade){
+      tree = this$ML
+      tree$tip.label = ExtractString(tree$tip.label, after = '_')
+      calculate_normalized_distance(cophenetic(tree), clade)/sum(tree$edge.length)
+    })
+  }))
+)
+
+Heatmap2(t(apply(robust.res.dist, 1, as.numeric)))#, col = colorRamp2(c(-1, 0, 1), c('blue', 'white', 'red')))
+```
+
+Sihloutte score
+
+```{r}
+robust.res.dist = rbind(
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+    sapply(clades, function(clade){
+      tree = this$UPGMA
+      tree$tip.label = ExtractString(tree$tip.label, after = '_')
+      calculate_silhouette_coefficient(cophenetic(tree), clade, clades)
+    })
+  })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+    sapply(clades, function(clade){
+      tree = this$NJ
+      tree$tip.label = ExtractString(tree$tip.label, after = '_')
+      calculate_silhouette_coefficient(cophenetic(tree), (clade), clades)
+    })
+  })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+    sapply(clades, function(clade){
+      tree = this$MP
+      tree$tip.label = ExtractString(tree$tip.label, after = '_')
+      calculate_silhouette_coefficient(cophenetic(tree), (clade), clades)
+    })
+  })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+    sapply(clades, function(clade){
+      tree = this$ML
+      tree$tip.label = ExtractString(tree$tip.label, after = '_')
+      calculate_silhouette_coefficient(cophenetic(tree), (clade), clades)
+    })
+  }))
+)
+
+Heatmap2(t(apply(robust.res.dist, 1, as.numeric)), col = colorRamp2(c(-1, 0, 1), c('blue', 'white', 'red')))
+```
+
+Proceeding with presence 
+
+```{r, fig.height=3, fig.width=4}
+plot(ctree)
+nodelabels(1:Nnode(ctree) + 42)
+ctree3 = root(ctree, node = 59, edgelabel = TRUE)
+ctree3$node.label = as.numeric(ctree3$node.label)
+ctree2$node.label = as.numeric(ctree2$node.label)
+plotBS(ctree)
+plotBS(ctree2)
+plotBS(ctree3)
+
+dend = as.dendrogram(ctree3)
+dend = dendextend::rotate(dend, order = c("26_A8", "24_SEG", "2_NNgly", "34", "17_ROBO3", "15", "18_TRHDE", "41_TRHDE", "27_VG3", "22_A2", "21_PDGFRA", "28", "5", "36_VIP", "37", "1_MAF", "3", "9", "20", "6_NPY", "13", "40", "8_SAC", "42", "38", "14_CA2", "16_NNgaba", "4_nNOS", "31_nNOS", "10_MAF", "23_RXRG", "39", "35", "7", "33_CA1", "11", "25", "12_nNOS", "19_CRH", "30_A17", "32_A17", "29_SLC35D3"))
+plot(dend)
+saveRDS(dend, 'tf_analysis/dend.rds')
+type.order = labels(dend)
+type.order.no = ExtractString(type.order, after = '_')
+
+
+# Make a type by presence matrix
+pres.mat = matrix(rep(type.order.no, nrow(robust.res)), ncol = length(type.order.no), nrow = nrow(robust.res), byrow = T)
+pres.mat = t(apply(pres.mat, 1, function(x) as.character(unlist(convert_values(x, invert_list(clades))))))
+head(pres.mat)
+
+# Fill with results
+pres.mat.filled = pres.mat
+for(i in seq_len(nrow(robust.res))){
+  for(clade in names(clades)){
+    row = pres.mat[i,]
+    if(!robust.res[i,as.numeric(clade)]) pres.mat.filled[i,row == clade] = NA
+  }
+}
+
+Heatmap(pres.mat.filled[,order(as.numeric(type.order.no))], cluster_columns = dend, 
+        col = AcPalette3(11), 
+        # rect_gp = gpar(col = "grey", lwd = 0.1),
+        border_gp = gpar(col = "black", lty = 1), 
+        show_heatmap_legend = FALSE
+        )
+```
+
+# Gene panels
+
+```{r, fig.height=7, fig.width=12}
+ac.ortho$type_clean = factor(gsub('\\*', '', ac.ortho$type_unordered), 
+                             levels = gsub('\\*', '', levels(ac.ortho$type_unordered)))
+
+genes.omit = c()
+# c('HLF', 'RORB', 'ZFPM2', 'ZNF503', 'FOXP1', 'DACH1', 'CUX2', 'KLF7', 'ZNF488', 'NR2F2', 'NR2F1', 
+               # 'PBX1', 'ZNF521', 'POU3F3', 'ZBTB18', 'FEZF1', 'FOXN2', 
+               # 'GBX2', 'FEZF2', 'ZNF536', 'BNC1', 'NR1H4', 'ONECUT1', 'TFAP2E', 'EOMES', 'SOX5', 'ESRRG', 'BCL11B')
+
+single.type.genes = c('NR1H4', 'ONECUT1', 'EOMES', 'SOX2', 'ISL1', 'GBX2')
+
+family.genes = setdiff(setdiff(c(tfs.use, 'TFAP2A'), genes.omit), single.type.genes)
+clust = hclust(dist(tf.expr.mask[family.genes,], method = 'binary'))
+family.genes.ordered = clust$labels[clust$order]
+
+# Family-defining TFs
+ClusteredDotplot2(ac.ortho, 
+                  features = family.genes.ordered, 
+                  group.by = 'type_clean', 
+                  cluster_rows = dend,
+                  max.pct = 40, 
+                  dot.scale.factor = 0.5, 
+                  pseudocount = 5, 
+                  rotate = TRUE, 
+                  show_row_dend = FALSE)
+
+# Type-defining TFs
+```
+
+
+```{r, fig.height=6, fig.width=8.5}
+# Rotate
+dend = as.dendrogram.phylo(midpoint(tf.trees$MP))
+tf.trees$MP2 = dendextend::rotate(dend, order = c("26_A8", "24_SEG", "2_NNgly", "34", "17_ROBO3", "15", "18_TRHDE", "27_VG3", "41_TRHDE", "22_A2", "21_PDGFRA", "28", "1_MAF", "3", "9", "20", "6_NPY", "13", "40", "8_SAC", "42", "38", "14_CA2", "16_NNgaba", "4_nNOS", "31_nNOS", "10_MAF", "23_RXRG", "39", "35", "7", "33_CA1", "11", "25", "12_nNOS", "19_CRH", "30_A17", "32_A17", "29_SLC35D3", "5", "36_VIP", "37"))
+
+ClusteredDotplot2(ac.ortho, 
+                  features = family.genes.ordered, 
+                  group.by = 'type_clean', 
+                  cluster_rows = tf.trees$MP2,
+                  max.pct = 40, 
+                  dot.scale.factor = 0.3, 
+                  pseudocount = 5, 
+                  rotate = TRUE)
+```
+
+
+```{r, fig.height=6, fig.width=5}
+adhesion.use = intersect(gene.lists$adhesion, names(which(r.squared.list > 0.60)))
+ClusteredDotplot2(ac.ortho, 
+                  features = adhesion.use, 
+                  group.by = 'type_clean', 
+                  cluster_rows = tf.trees$MP2,
+                  cluster_columns = TRUE,
+                  max.pct = 40, 
+                  dot.scale.factor = 0.3, 
+                  pseudocount = 5, 
+                  rotate = TRUE)
+
+adhesion.genes = c('UNC5D', 'CLMP', 'CDH7', 'DSCAM', 'CDH10', 'CDH8', 'CDH4', 'PCDH10', 'IGSF11', 'DSCAML1', 'CDH22', 'TENM3')
+ClusteredDotplot2(ac.ortho, 
+                  features = adhesion.genes, 
+                  group.by = 'type_clean', 
+                  cluster_rows = tf.trees$MP2,
+                  cluster_columns = TRUE,
+                  max.pct = 40, 
+                  dot.scale.factor = 0.3, 
+                  pseudocount = 5, 
+                  rotate = TRUE)
+```
+
+# Checkpoint 2
+
+```{r}
+conservation.summary = readRDS("../../Ortho_Objects/vertebrateAC_conservation_v2.rds")
+dend = readRDS('tf_analysis/dend.rds')
+ctree = readRDS('tf_analysis/ctree.rds')
+ctree_bl = readRDS('tf_analysis/ctree_bl.rds')
+ctree_bl$tip.label = ctree_bl$tip.label2
+ctree2 = readRDS('tf_analysis/ctree2.rds')
+# ctree2$edge.length = ctree2$edge.length/11 # similar to UPGMA and NJ tree sizes
+# Set 0 branch lengths to a small value
+ctree2$edge.length[ctree2$edge.length == 0] = 1e-5
+tf.expr.mask = readRDS("tf_analysis/k.mask.collapsed.rds")
+loo.trees.list = readRDS('tf_analysis/loo.trees.list.rds')
+gene.lists = readRDS('../../reference_files/gene-lists-ac.rds')
+r.squared.list = readRDS('tf_analysis/r.squared.list.rds')
+tfs.use = intersect(tf_genes, names(which(r.squared.list > 0.65)))
+
+ac.ortho$type_clean = factor(gsub('\\*', '', ac.ortho$type_unordered), 
+                             levels = gsub('\\*', '', levels(ac.ortho$type_unordered)))
+```
+
+# Phylogenetic signal
+
+```{r}
+library(phylolm)
+library(ape)
+
+# PhylogeneticSignalTest(tree, min_max_norm(trait_data$trait_B) %>% setNames(tree$tip.label))
+test = rtree(42)
+test$tip.label = colnames(tf.expr.mask)
+
+
+# Rank genes by PRT p-value
+phylo.res = do.call(rbind, apply(tf.expr.mask, 1, function(gene){
+  # names(gene) = ExtractString(gene, after = '_')
+  tryCatch({
+    PhylogeneticSignalTest(ctree2, gene)}, 
+    error = function(e) {
+      # Print the error message to the console
+      message("An error occurred: ", conditionMessage(e))
+      NULL
+  })
+}))
+
+phylo.res = phylo.res %>% arrange(pval)
+```
+
+```{r, fig.height=50, fig.width=10}
+ClusteredDotplot2(ac.ortho, 
+                  features = rownames(phylo.res), 
+                  group.by = 'type_clean', 
+                  cluster_columns = dend,
+                  max.pct = 40, 
+                  dot.scale.factor = 0.5, 
+                  pseudocount = 5, 
+                  rotate = FALSE)
+```
+
+Just TFs
+
+```{r, fig.height=20, fig.width=10}
+ClusteredDotplot2(ac.ortho, 
+                  features = intersect(rownames(phylo.res), gene.lists$tf_genes), 
+                  group.by = 'type_clean', 
+                  cluster_columns = dend,
+                  max.pct = 40, 
+                  dot.scale.factor = 0.5, 
+                  pseudocount = 5, 
+                  rotate = FALSE)
+
+
+glycinergic_families <- list(
+  Pan = c("TCF4"),
+  NFI_family = rev(c("NR2F2","NFIX", "NFIB", "NEUROD4", "SATB2", "EBF2",
+                 "EBF3", "ST18", "PROX1", "EBF1", "PRDM13")),
+  Neurod2_family = c("NEUROD2", "TFAP2B", 'TFAP2A'),
+  A2 = c("ONECUT1", "NFIA"),
+  VG3_family = c( "FOXP2", "BNC2", "TFAP2E", "NR1H4", "LHX2", "BNC1")
+)
+
+clades <- list(
+  c(22, 41, 27, 18, 15, 17, 34, 2, 26, 24), # gly
+  c(21, 28), # PDGFRA SOX5
+  c(36, 5, 37), # VIP SOX5 NR4A2
+  
+  c(40, 13, 6), # NPY ZFHX3 ZFHX4 MEIS2 ZBTB16 ESRRG
+  c(8, 42), # SAC ZFHX3 ZFHX4 MEIS2 TBX2 SIX3 ZBTB16 TFAP2D
+  c(1, 3, 9, 20), # MAF ZFHX3 ZFHX4 MEIS2 SIX3 ZBTB16 BHLHE22 PRDM8
+  c(23, 39), # ZFHX3 ZFHX4 MEIS2 SIX3 ZBTB16
+  
+  c(16, 14, 4, 31), # CA2 ZFHX3 ZFHX4 MEIS2 LHX2
+  c(33, 7), # CA1 ZFHX3 ZFHX4 MEIS2 TSHZ1
+  c(12, 11, 25, 19, 32, 30), # CRH MEIS2 ZNF536 DACH2 LHX9
+  c(29, 35, 38, 10) # not robust
+)
+
+```
+
+
+```{r}
+# adhesion.show = sort(unique(c('UNC5D', 'CLMP', 'CDH7', 'DSCAM', 'CDH10', 'CDH8', 'CDH4', 'PCDH10', 'IGSF11', 
+#                               'DSCAML1', 'CDH22', 'TENM3', 'IGSF11', 'DSCAM', 'DSCAML1', 'CDH10', 'PCHD19', 
+#                               'CDH8', 'PCDH10', 'PCDH17', 'CDH22')))
+ClusteredDotplot2(ac.ortho, 
+                  features = intersect(rownames(phylo.res), gene.lists$adhesion), 
+                  group.by = 'type_clean', 
+                  cluster_columns = dend,
+                  max.pct = 40, 
+                  dot.scale.factor = 0.5, 
+                  pseudocount = 5, 
+                  rotate = FALSE)
+```
+
+# Reconstruction of developmental sequence
+
+
+```{r, fig.height=12, fig.width=20}
+# Run the checkpoint 1 before this
+library(phangorn)
+ctree2 = readRDS('tf_analysis/ctree2.rds')
+treeRooted = ctree2
+for(this.node in (c(67,69,68,70,72))){
+  treeRooted = ape::rotate(treeRooted, node = this.node)
+}
+# treeRooted = ctree2
+# treeRooted = makeNodeLabel(treeRooted)
+# treeRooted = root(treeRooted, node = 66)
+# treeRooted = ape::rotate(treeRooted, node = 43)
+plot(treeRooted, direction = 'downward')
+nodelabels(1:treeRooted$Nnode + length(treeRooted$tip.label))
+
+# treeRooted = ape::rotate(treeRooted, node = 70)
+# plot(treeRooted, direction = 'downward')
+# nodelabels(1:treeRooted$Nnode + length(treeRooted$tip.label))
+
+phydat = BinaryPhyDat(t(tf.expr.mask[tfs.use,]))
+anc.acctran = anc_pars(treeRooted, phydat, type = 'ACCTRAN')
+tf.order = tfs.use
+# anc.mpr <- ancestral.pars(treeRooted, phydat, "MPR")
+
+pdf("tf_analysis/reconstruction_v4_acctran.pdf", height = 6.5, width = 6.5)
+for(gene in tfs.use){
+  # plotAnc(treeLabeled, anc.mpr, which(tf.order == gene), type = "phylogram", cex.pie = 0.4, col = c("white", "black"))
+  plotAnc(anc.acctran, which(tfs.use == gene), type = "phylogram", cex.pie = 0.3, col = c("white", "black"), cex = 0.6, show.node.label = FALSE)
+  title(gene)
+}
+dev.off()
+```
+
+Find TF switches
+
+```{r, fig.height=30, fig.width=20}
+anc.acctran <- ancestral.pars(treeRooted, phydat, "ACCTRAN")
+gained = apply(treeRooted$edge, 1, function(row){
+  gained = tf.order[which(ceiling(anc.acctran[[row[2]]][,2]) - ceiling(anc.acctran[[row[1]]][,2]) > 0)] #& anc.acctran[[row[1]]][,2] == 0)] # an increase from 0 (not expressed)
+  if(length(gained) > 0){
+    gained = paste0(gained, "+")
+    paste0(gained, collapse = "\n")
+  } else {
+    NA
+  }
+})
+
+lost = apply(treeRooted$edge, 1, function(row){
+  lost = tf.order[which(ceiling(anc.acctran[[row[2]]][,2]) - ceiling(anc.acctran[[row[1]]][,2]) < 0)] #& anc.acctran[[row[1]]][,2] == 1)] # a decrease from 1 (expressed)
+  if(length(lost) > 0){
+    lost = paste0(lost, "-")
+    paste0(lost, collapse = "\n")
+  } else {
+    NA
+  }
+})
+
+# Plot gained TFs
+pdf("tf_analysis/labeled_tree_gained_lost_v4.pdf", height=30, width=20)
+plot(treeRooted, show.node.label = TRUE)
+edgelabels(gained, srt = 0, bg = "green")
+
+# Plot lost TFs
+plot(treeRooted, show.node.label = TRUE)
+edgelabels(lost, srt = 0, bg = "red")
+dev.off()
+
+# Plot all TF switches
+switches = gsub('^\n|\n$', '', gsub("NA", "", paste0(gained, "\n", lost)))
+switches[switches == "\n"] = NA
+
+pdf("tf_analysis/labeled_tree_v4.pdf", height = 20, width = 30)
+plot(treeRooted, show.node.label = FALSE, direction = "downwards")
+edgelabels(switches, srt = 0, bg = "white")
+add.scale.bar()
+dev.off()
+
+pdf("../../figures/my_figs/figS-labeled_tree_v6.pdf", height = 30, width = 22, family = "ArialMT")
+treeRooted3 = treeRooted
+treeRooted3$tip.label = gsub(' ', '\n', orthotype_labels(treeRooted$tip.label, asterisk = FALSE, as.factor = FALSE))
+plot(treeRooted3, show.node.label = FALSE, 
+     edge.width = 2,
+     # direction = "downwards", 
+     show.tip.label = FALSE)
+tiplabels(
+  text = treeRooted3$tip.label,
+  tip = 1:length(treeRooted3$tip.label),
+  srt = 0,              # rotate 90 degrees
+  adj = 0,               # vertical alignment
+  frame = "none",
+  col = "black"
+)
+edgelabels(switches, srt = 0, bg = "white", cex = 1, font = 3)
+add.scale.bar(lwd = 2)
+dev.off()
+```
+
+Save genes for later
+
+```{r}
+tf.switches.clean = lapply(str_split(switches, '\n'), function(x) gsub('\\-|\\+', '', x))
+saveRDS(tf.switches.clean, 'tf_analysis/tf.switches.clean.rds')
+```
+
+Plot tree skeleton
+
+```{r}
+pdf('tf_analysis/tree_skeleton.pdf')
+treeRooted2 = root(treeRooted, node = 66, edgelabel = TRUE)
+plot(treeRooted2, show.node.label = FALSE, direction = "downwards")
+add.scale.bar()
+dev.off()
+```
+
+
+```{r}
+#' Could also do reconstruction on multifurcating tree now? 
+# Run the checkpoint 1 before this
+library(phangorn)
+treeRooted = readRDS('tf_analysis/ctree.rds')
+# for(this.node in (c(67,69,68,70,72))){
+#   treeRooted = ape::rotate(treeRooted, node = this.node)
+# }
+plot(treeRooted, direction = 'downward')
+nodelabels(1:treeRooted$Nnode + length(treeRooted$tip.label))
+phydat = BinaryPhyDat(t(tf.expr.mask[tfs.use,]))
+anc.acctran = anc_pars(treeRooted, phydat, type = 'ACCTRAN')
+```
+
+# Figure 5
+
+## Tree
+
+```{r}
+library(ggtree)
+library(treeio)
+
+beast_file <- system.file("examples/MCC_FluA_H3.tree", package="ggtree")
+beast_tree <- read.beast(beast_file)
+
+genotype_file <- system.file("examples/Genotype.txt", package="ggtree")
+genotype <- read.table(genotype_file, sep="\t", stringsAsFactor=F)
+colnames(genotype) <- sub("\\.$", "", colnames(genotype))
+p <- ggtree(beast_tree, mrsd="2013-01-01") + 
+    geom_treescale(x=2008, y=1, offset=2) + 
+    geom_tiplab(size=2)
+gheatmap(p, genotype, offset=5, width=0.5, font.size=3, 
+        colnames_angle=-45, hjust=0) +
+    scale_fill_manual(breaks=c("HuH3N2", "pdm", "trig"), 
+        values=c("steelblue", "firebrick", "darkgreen"), name="genotype")
+p <- ggtree(beast_tree, mrsd="2013-01-01") + 
+    geom_tiplab(size=2, align=TRUE, linesize=.5) + 
+    theme_tree2()
+gheatmap(p, genotype, offset=8, width=0.6, 
+        colnames=FALSE, legend_title="genotype") +
+    scale_x_ggtree() + 
+    scale_y_continuous(expand=c(0, 0.3))
+```
+
+```{r}
+plot(ctree)
+plot(dend)
+# plot(ctree2)
+
+ggtree(as.treedata(ctree))+
+  geom_tiplab()
+# ggtree(as.treedata(treeio::as.phylo(dend)))
+```
+
+```{r}
+set.seed(2016-05-29)
+x <- rtree(50)
+p <- ggtree(x) + geom_tiplab()
+
+## nn <- unique(reorder(x, 'postorder')$edge[,1]) 
+## to traverse all the internal nodes
+
+nn <- sample(unique(reorder(x, 'postorder')$edge[,1]), 4)
+
+pp <- lapply(nn, function(n) {
+    p <- rotate(p, n)
+    p + geom_point2(aes(subset=(node == n)), color='red', size=3)
+})
+
+plot_list(gglist=pp, tag_levels='A', nrow=1)
+```
+
+## Low resolution clades
+
+```{r, fig.height=7, fig.width=4}
+clades.broad <- list(
+  c(22, 41, 27, 18, 15, 17, 34, 2, 26, 24), # gly
+  c(21, 28), # PDGFRA
+  c(36, 5, 37), # VIP
+  c(1, 3, 9, 20, 23, 39, 33, 7, 8, 42, 40, 13, 6, 16, 14, 4, 31, 10, 35, 38), # gaba
+  c(12, 11, 25, 19, 32, 30), # CRH
+  c(29) # not robust
+)
+clades.broad = lapply(clades.broad, as.character)
+names(clades.broad) = 1:length(clades.broad)
+
+# Binary presence doesn't capture some cases
+robust.res = rbind(
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+  sapply(clades.broad, function(clade){
+    tree = this$UPGMA
+    tree$tip.label = ExtractString(tree$tip.label, after = '_')
+    is.monophyletic(tree, tips = as.character(clade)) | are_adjacent_tips(tree, clade)
+    })
+  })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+    sapply(clades.broad, function(clade){
+      tree = this$NJ
+      tree$tip.label = ExtractString(tree$tip.label, after = '_')
+      is.monophyletic(tree, tips = as.character(clade)) | are_adjacent_tips(tree, clade)
+    })
+  })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+      sapply(clades.broad, function(clade){
+        tree = this$MP
+        tree$tip.label = ExtractString(tree$tip.label, after = '_')
+        is.monophyletic(tree, tips = as.character(clade)) | are_adjacent_tips(tree, clade)
+      })
+    })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+        sapply(clades.broad, function(clade){
+          tree = this$ML
+          tree$tip.label = ExtractString(tree$tip.label, after = '_')
+          is.monophyletic(tree, tips = as.character(clade)) | are_adjacent_tips(tree, clade)
+        })
+    }))
+)
+
+# Heatmap2(t(apply(robust.res, 1, as.numeric)))
+# saveRDS(robust.res, 'tf_analysis/robust.res.binary.broad.rds')
+
+dend = readRDS('tf_analysis/dend.rds')
+type.order = labels(dend)
+type.order.no = ExtractString(type.order, after = '_')
+
+# Make a type by presence matrix
+pres.mat = matrix(rep(type.order.no, nrow(robust.res)), ncol = length(type.order.no), nrow = nrow(robust.res), byrow = T)
+pres.mat = t(apply(pres.mat, 1, function(x) as.character(unlist(convert_values(x, invert_list(clades.broad))))))
+
+# Fill with results
+pres.mat.filled = pres.mat
+for(i in seq_len(nrow(robust.res))){
+  for(clade in names(clades.broad)){
+    row = pres.mat[i,]
+    if(!robust.res[i,as.numeric(clade)]) pres.mat.filled[i,row == clade] = NA
+  }
+}
+
+method = c(rep('UPGMA', 70), rep('NJ', 70), rep('MP', 70), rep('ML', 70))
+final.pres = t(pres.mat.filled[,order(as.numeric(type.order.no))])
+rownames(final.pres) = levels(ac.ortho$type_unordered)
+
+# Set 29 to NA
+final.pres['29_SLC35D3',] = NA
+
+rownames(final.pres) = orthotype_labels(rownames(final.pres), as.factor = FALSE)
+
+pdf('../../figures/my_figs/tf-robustness-broad.pdf', height = 7, width = 2.2)
+draw(Heatmap(final.pres, 
+        name = "mat",
+        cluster_rows = dend, 
+        col = c('1' = "#FF94BB", '2' = "#FFA500", '3' = "#FFCA9E", '4' = "#A5FFFF", '5' = "#FFB1FF"),
+        # rect_gp = gpar(col = "grey", lwd = 0.1),
+        border_gp = gpar(col = "black", lwd = NA), 
+        show_heatmap_legend = FALSE, 
+        show_row_dend = TRUE,
+        show_row_names = TRUE,
+        row_dend_gp = gpar(lwd = 2),
+        row_names_gp = gpar(fontsize = 9),
+        row_names_side = 'left',
+        top_annotation = HeatmapAnnotation(method = method, 
+                                   col = list(method = c('white', 'grey', 'brown', 'black') %>% setNames(METHODS)), 
+                                   border = TRUE, show_legend = FALSE, show_annotation_name = FALSE)
+        ), 
+  padding = unit(c(0.1, 0.1, 0.1, 0.1), "mm") # Top, right, bottom, left padding
+)
+breaks = seq_len(ncol(pres.mat.filled))
+for(index in breaks) {
+  x_coord = index/length(breaks)
+  decorate_heatmap_body("mat", row_slice = 1, {
+    # grid.lines(c(0, 1), c(1-x_coord, 1-x_coord), gp = gpar(lty = 1, lwd = 0.75))
+  })
+}
+for(index in 1:3) {
+  y_coord = (index * 70)/280
+  decorate_heatmap_body("mat", row_slice = 1, {
+    grid.lines(c(y_coord, y_coord), c(0, 1), gp = gpar(lty = 2, lwd = 0.75))
+  })
+}
+dev.off()
+```
+
+Some fraction of the clade has to be present
+
+```{r, fig.height=7, fig.width=4}
+clades.broad <- list(
+  c(22, 41, 27, 18, 15, 17, 34, 2, 26, 24), # gly
+  c(21, 28), # PDGFRA
+  c(36, 5, 37), # VIP
+  c(1, 3, 9, 20, 23, 39, 33, 7, 8, 42, 40, 13, 6, 16, 14, 4, 31, 10, 35, 38), # gaba
+  c(12, 11, 25, 19, 32, 30), # CRH
+  c(29) # not robust
+)
+clades.broad = lapply(clades.broad, as.character)
+names(clades.broad) = 1:length(clades.broad)
+
+# Just get the fraction 
+robust.res = rbind(
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+    sapply(clades.broad[1:5], function(clade){
+      find_fraction_nodes(this$UPGMA, clade)
+    })
+  })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+    sapply(clades.broad[1:5], function(clade){
+      find_fraction_nodes(this$NJ, clade)
+    })
+  })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+      sapply(clades.broad[1:5], function(clade){
+        find_fraction_nodes(this$MP, clade)
+    })
+  })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+      sapply(clades.broad[1:5], function(clade){
+        find_fraction_nodes(this$ML, clade)
+    })
+  }))
+)
+robust.res = cbind(robust.res, 1) 
+colnames(robust.res)[[6]] = '6'
+
+dend = readRDS('tf_analysis/dend.rds')
+type.order = labels(dend)
+type.order.no = ExtractString(type.order, after = '_')
+
+# Make a type by presence matrix
+pres.mat = matrix(rep(type.order.no, nrow(robust.res)), ncol = length(type.order.no), nrow = nrow(robust.res), byrow = T)
+pres.mat = t(apply(pres.mat, 1, function(x) as.character(unlist(convert_values(x, invert_list(clades.broad))))))
+
+# Fill with results
+pres.mat.filled = pres.mat
+for(i in seq_len(nrow(robust.res))){
+  for(clade in names(clades.broad)){
+    if(robust.res[i,as.numeric(clade)] <= 0.5){
+      # row = pres.mat[i,]
+      pres.mat.filled[i, row == clade] = NA
+      # if(!robust.res[i,as.numeric(clade)]) pres.mat.filled[i,row == clade] = NA
+    }
+  }
+}
+
+method = c(rep('UPGMA', 70), rep('NJ', 70), rep('MP', 70), rep('ML', 70))
+final.pres = t(pres.mat.filled[,order(as.numeric(type.order.no))])
+rownames(final.pres) = levels(ac.ortho$type_unordered)
+
+# Set 29 to NA
+final.pres['29_SLC35D3',] = NA
+
+pdf('../../figures/my_figs/tf-robustness-broad-2.pdf', height = 7, width = 2.2)
+draw(Heatmap(final.pres, 
+        name = "mat",
+        cluster_rows = dend, 
+        col = c('1' = "#FF94BB", '2' = "#FFA500", '3' = "#FFCA9E", '4' = "#A5FFFF", '5' = "#FFB1FF"),
+        # rect_gp = gpar(col = "grey", lwd = 0.1),
+        border_gp = gpar(col = "black", lwd = NA), 
+        show_heatmap_legend = FALSE, 
+        show_row_dend = TRUE,
+        show_row_names = TRUE,
+        row_names_side = 'left',
+        top_annotation = HeatmapAnnotation(method = method, 
+                                           col = list(method = c('white', 'grey', 'brown', 'black') %>% setNames(METHODS)), 
+                                           border = TRUE, 
+                                           show_legend = FALSE, 
+                                           show_annotation_name = FALSE)
+        ), 
+  padding = unit(c(0.1, 0.1, 0.1, 0.1), "mm") # Top, right, bottom, left padding
+)
+breaks = seq_len(ncol(pres.mat.filled))
+for(index in breaks) {
+  x_coord = index/length(breaks)
+  decorate_heatmap_body("mat", row_slice = 1, {
+    # grid.lines(c(0, 1), c(1-x_coord, 1-x_coord), gp = gpar(lty = 1, lwd = 0.75))
+  })
+}
+for(index in 1:3) {
+  y_coord = (index * 70)/280
+  decorate_heatmap_body("mat", row_slice = 1, {
+    grid.lines(c(y_coord, y_coord), c(0, 1), gp = gpar(lty = 2, lwd = 0.75))
+  })
+}
+dev.off()
+```
+
+What's going on with NJ
+
+```{r}
+phy1 <- root(all.trees$all$NJ, node = 72)
+phy2 <- root(all.trees$all$MP, node = 49)
+
+plot_tanglegram(force.ultrametric(midpoint(loo.trees.list[[4]][[1]]$NJ), method = "extend"), 
+                force.ultrametric(midpoint(loo.trees.list[[4]][[1]]$UPGMA), method = "extend"))
+
+plot(midpoint(loo.trees.list[[4]][[1]]$NJ))
+# plot(force.ultrametric(midpoint(loo.trees.list[[4]][[1]]$NJ), method = "extend"))
+# plot(force.ultrametric(midpoint(loo.trees.list[[4]][[1]]$MP), method = "extend"))
+```
+
+
+```{r}
+# Let's document the issues
+
+
+# Clade 1 is fine 
+
+# Clade 2 is simply not robust
+tree = loo.trees.list[[4]][[3]]$NJ
+tree$tip.label = ExtractString(tree$tip.label, after = '_')
+tip_cols <- ifelse(tree$tip.label %in% clades.broad$`2`, "red", "black")
+plot(midpoint(tree), tip.color = tip_cols, cex = 1)
+are_adjacent_tips(tree, clades.broad$`2`)
+
+# Clade 3 is robust everywhere except ML
+tree = loo.trees.list[[4]][[1]]$ML
+tree$tip.label = ExtractString(tree$tip.label, after = '_')
+tip_cols <- ifelse(tree$tip.label %in% clades.broad$`3`, "red", "black")
+plot(midpoint(tree), tip.color = tip_cols, cex = 1)
+
+# Clade 4 is everywhere except in NJ
+# There is an insertion of a clade disrupting it
+tree = loo.trees.list[[4]][[1]]$NJ
+tree$tip.label = ExtractString(tree$tip.label, after = '_')
+tip_cols <- ifelse(tree$tip.label %in% clades.broad$`4`, "red", "black")
+plot(midpoint(tree), tip.color = tip_cols, cex = 1)
+
+# Clade 5
+tree = loo.trees.list[[4]][[2]]$ML
+tree$tip.label = ExtractString(tree$tip.label, after = '_')
+tip_cols <- ifelse(tree$tip.label %in% clades.broad$`5`, "red", "black")
+plot(midpoint(tree), tip.color = tip_cols, cex = 1)
+
+# New clades to try
+# clades.broad <- list(
+#   c(22, 41, 27, 18, 15, 17, 34, 2, 26, 24), # gly
+#   c(21, 28, 36, 5, 37), # PDGFRA and VIP
+#   c(1, 3, 9, 20, 23, 39, 
+#     40, 13, 6), 
+#     16, 14, 4, 31, 10, 35, 38), # gaba 33, 7, 8, 42, 
+#   c(12, 11, 25, 19, 32, 30), # CRH
+#   c(29) # not robust
+# )
+
+# clades.broad <- list(
+#   c(22, 41, 27, 18, 15, 17, 34, 2, 26, 24), # gly
+#   # c(15, 17, 34, 2, 26, 24), # gly
+#   c(41, 27), 
+#   c(21, 28), # PDGFRA
+#   c(36, 5), # VIP
+#   c(40, 13), # NPY
+#   c(1, 3, 9, 20), # MAF
+#   c(23, 39),
+#   c(8, 42), # SAC
+#   c(16, 14, 4, 31), # CA2
+#   c(33, 7), # CA1
+#   c(11, 12, 25), # CRH
+#   c(32, 30), # A17
+#   c(29, 35, 38, 10, 22, 18, 19, 37, 6) # not robust
+# )
+```
+
+## High resolution clades
+
+```{r, fig.height=7, fig.width=4}
+clades <- list(
+  # c(22, 41, 27, 18, 15, 17, 34, 2, 26, 24), # gly
+  c(15, 17, 34, 2, 26, 24), # gly
+  c(41, 27), 
+  c(21, 28), # PDGFRA
+  c(36, 5), # VIP
+  c(40, 13), # NPY
+  c(1, 3, 9, 20), # MAF
+  c(23, 39),
+  c(8, 42), # SAC
+  c(16, 14), # CA2
+  c(33, 7), # CA1
+  c(11, 12, 25, 19), # CRH
+  c(32, 30), # A17
+  c(29, 35, 38, 10, 22, 18, 37, 6, 31, 4) # not robust
+)
+clades = lapply(clades, as.character)
+names(clades) = 1:length(clades)
+
+# Binary presence doesn't capture some cases
+robust.res = rbind(
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+  sapply(clades, function(clade){
+    tree = this$UPGMA
+    tree$tip.label = ExtractString(tree$tip.label, after = '_')
+    is.monophyletic(tree, tips = as.character(clade)) | are_adjacent_tips(tree, clade)
+  })
+})), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+    sapply(clades, function(clade){
+      tree = this$NJ
+      tree$tip.label = ExtractString(tree$tip.label, after = '_')
+      is.monophyletic(tree, tips = as.character(clade)) | are_adjacent_tips(tree, clade)
+    })
+  })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+      sapply(clades, function(clade){
+        tree = this$MP
+        tree$tip.label = ExtractString(tree$tip.label, after = '_')
+        is.monophyletic(tree, tips = as.character(clade)) | are_adjacent_tips(tree, clade)
+      })
+    })), 
+  do.call(rbind, lapply(loo.trees.list[[4]], function(this){
+        sapply(clades, function(clade){
+          tree = this$ML
+          tree$tip.label = ExtractString(tree$tip.label, after = '_')
+          is.monophyletic(tree, tips = as.character(clade)) | are_adjacent_tips(tree, clade)
+        })
+    }))
+)
+
+# Heatmap2(t(apply(robust.res, 1, as.numeric)))
+# saveRDS(robust.res, 'tf_analysis/robust.res.binary.rds')
+
+dend = readRDS('tf_analysis/dend.rds')
+type.order = labels(dend)
+type.order.no = ExtractString(type.order, after = '_')
+
+# Make a type by presence matrix
+pres.mat = matrix(rep(type.order.no, nrow(robust.res)), ncol = length(type.order.no), nrow = nrow(robust.res), byrow = T)
+pres.mat = t(apply(pres.mat, 1, function(x) as.character(unlist(convert_values(x, invert_list(clades))))))
+
+# Fill with results
+pres.mat.filled = pres.mat
+for(i in seq_len(nrow(robust.res))){
+  for(clade in names(clades)){
+    row = pres.mat[i,]
+    if(!robust.res[i,as.numeric(clade)]) pres.mat.filled[i,row == clade] = NA
+  }
+}
+
+pdf('../../figures/my_figs/tf-robustness.pdf', height = 7, width = 0.75)
+method = c(rep('UPGMA', 70), rep('NJ', 70), rep('MP', 70), rep('ML', 70))
+final.pres = t(pres.mat.filled[,order(as.numeric(type.order.no))])
+rownames(final.pres) = levels(ac.ortho$type_unordered)
+draw(Heatmap(final.pres, 
+        name = "mat",
+        cluster_rows = dend, 
+        col = AcPalette3(length(clades)-1) %>% setNames(names(clades)[1:(length(clades)-1)]), 
+        # rect_gp = gpar(col = "grey", lwd = 0.1),
+        border_gp = gpar(col = "black", lwd = NA), 
+        show_heatmap_legend = FALSE, 
+        show_row_dend = FALSE,
+        show_row_names = FALSE,
+        row_names_side = 'left',
+        top_annotation = HeatmapAnnotation(method = method, 
+                                           col = list(method = c('white', 'grey', 'brown', 'black') %>% setNames(METHODS)), 
+                                           border = TRUE, show_legend = FALSE, show_annotation_name = FALSE)
+        ),
+padding = unit(c(0.1, 0.1, 0.1, 0.1), "mm") # Top, right, bottom, left padding
+)
+breaks = seq_len(ncol(pres.mat.filled))
+for(index in breaks) {
+  x_coord = index/length(breaks)
+  decorate_heatmap_body("mat", row_slice = 1, {
+    # grid.lines(c(0, 1), c(1-x_coord, 1-x_coord), gp = gpar(lty = 1, lwd = 0.75))
+  })
+}
+for(index in 1:3) {
+  y_coord = (index * 70)/280
+  decorate_heatmap_body("mat", row_slice = 1, {
+    grid.lines(c(y_coord, y_coord), c(0, 1), gp = gpar(lty = 2, lwd = 0.75))
+  })
+}
+dev.off()
+```
+
+## Gene panels
+
+```{r, fig.width=11, fig.height=7.5}
+tf.show = c(
+  
+  # Pan
+  # 'TFAP2A', 
+  'TFAP2B', 
+  
+  # Gaba
+  'MEIS2', 'ZEB2', 
+  'SOX5', 'DACH2', 'LHX9', 'ZNF536',
+  'POU6F2', 'ZFHX3', 'ZFHX4', 
+  'TSHZ1', 
+  'TBX3',
+  'LHX2',
+  'TFAP2D',
+  'TBX2', 
+  # 'SIX3', 
+  'NR4A2', 
+  'BHLHE22',
+  'PRDM8', 
+  
+  # Gly
+  "TCF4", 'ZNF804A',
+  
+  "NEUROD2", 
+  # "TFAP2B",
+  # "TFAP2A", 
+  'NEUROD1', 'ESRRG', 'DACH1', 'NFIA', "PROX1", "ST18", 'ONECUT1', # A2 enriched
+  "FOXP2", "BNC2", "BNC1",
+  
+  "PRDM13", "EBF1", #"PROX1", "ST18",
+  "EBF3",
+  "SATB2", "NEUROD4", "NFIB", "NFIX"
+)
+
+ac.ortho$orthotype.tf = factor(orthotype_labels(ac.ortho$type),
+                               levels = (c("oAC11", "oAC14 [A17]", "oAC13 [A17]", "oAC37* [CRH]", "oAC38* [nNOS]",
+                                          "oAC23*", "oAC22*", "oAC39* [CA1]", "oAC28", "oAC12", "oAC21*",
+                                          "oAC40 [nNOS]", "oAC18 [nNOS]", "oAC36* [nGnG-ga]", "oAC19 [CA2]",
+                                          "oAC27", "oAC26", "oAC42* [SAC]", "oAC35", "oAC34", "oAC29", "oAC15",
+                                          "oAC17*", "oAC16*", "oAC20 [NPY]", "oAC25", "oAC24", "oAC41",
+                                          "oAC33 [VIP]", "oAC32", "oAC31", "oAC30 [PDGFRA]", "oAC1 [A2]",
+                                          "oAC2 [VG3]", "oAC4", "oAC3", "oAC9", "oAC10", "oAC5",
+                                          "oAC8 [nGnG-gl]", "oAC7 [SEG]", "oAC6 [A8]")))
+
+# pdf('../../figures/my_figs/tf-show.pdf', height=9, width=5.2)
+# ClusteredDotplot2(ac.ortho, 
+#                   features = tf.show, 
+#                   group.by = 'orthotype.tf', 
+#                   # cluster_rows = dend,
+#                   max.pct = 40, 
+#                   dot.scale.factor = 0.35, 
+#                   pseudocount = 5, 
+#                   rotate = TRUE, 
+#                   show.legend = FALSE, 
+#                   show_row_names = FALSE, 
+#                   show_row_dend = FALSE, 
+#                   border_gp = gpar(col = "black", lwd = 3),
+#                   column_names_side = 'top')
+# dev.off()
+
+bin.mat = tf.expr.mask[tf.show,]
+colnames(bin.mat) = orthotype_labels(colnames(bin.mat), asterisk = FALSE)
+bin.mat = bin.mat[,levels(ac.ortho$orthotype.tf)]
+DotPlot3(ac.ortho, 
+        features = tf.show, 
+        group.by = 'orthotype.tf', 
+         max.pct = 40, 
+        max.size = 4, 
+        binarization = bin.mat) + 
+  # scale_y_discrete(position = "right")+
+  guides(y = guide_axis(position = "right")) +
+  theme(
+    axis.text.y.left  = element_blank(),
+    axis.ticks.y.left = element_blank(),
+    axis.title.y.left = element_blank(),
+    axis.text.y = element_text(size = 11), 
+    axis.ticks.y = element_blank(), 
+    axis.ticks.length.y = unit(0, 'cm')
+  )+
+  theme(axis.text.x = element_blank(), 
+       axis.ticks.x = element_blank(), 
+       axis.line = element_blank(),
+       panel.border = element_rect(fill = NA, colour = "black", linewidth=1))
+
+ggsave('../../figures/my_figs/tf-show.pdf', width=11, height=5.85)
+```
+
+
+```{r, fig.width=11, fig.height=5.2}
+# adhesion.show = c('DSCAM', 'UNC5D', 'TENM3', 
+#                   'CLMP', 'CDH10', 'CDH8', 'PCDH10', 
+#                   'PCDH19', 
+#                   #'PCDH17',
+#                   'DSCAML1', 'IGSF11', 'CDH4')
+# 
+# pdf('../../figures/my_figs/adhesion-show.pdf', height=9, width=2)
+# ClusteredDotplot2(ac.ortho, 
+#                   features = adhesion.show, 
+#                   group.by = 'type_clean', 
+#                   cluster_rows = dend,
+#                   max.pct = 40, 
+#                   dot.scale.factor = 0.35, 
+#                   pseudocount = 5, 
+#                   col.high = '#934E93',
+#                   rotate = TRUE, 
+#                   show.legend = FALSE, 
+#                   show_row_names = FALSE, 
+#                   show_row_dend = FALSE, 
+#                   border_gp = gpar(col = "black", lwd = 3),
+#                   column_names_side = 'top')
+# dev.off()
+```
+
+Other TFs
+
+```{r}
+ac.ortho$type_tf = factor(gsub('\\*', '', ac.ortho$type), levels = labels(dend))
+geneDotPlotFast(ac.ortho, group.by = 'type_tf', gene = 'TBX3')
+```
+
+
+# Co-mentions in literature
+
+```{r}
+tfs.considered = intersect(gene.lists$tf_genes, conservation.summary$gene)
+write.table(tfs.considered, 'tf_analysis/tfs.considered.tsv', quote = FALSE, row.names = FALSE, col.names = FALSE)
+pubmed.counts = lapply(tfs.considered, function(gene){
+  pubmed_command <- paste0("curl -s 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=", gene, "+%22amacrine%22' | grep '<Count>' | sed -e 's/<Count>//' -e 's/\\s*<\\/Count>//'")
+  result <- system(pubmed_command, intern = TRUE)
+  as.numeric(ExtractString(result, before = '<eSearchResult>', after = '<RetMax>'))
+}) %>% setNames(tfs.considered)
+pubmed.counts
+
+saveRDS(pubmed.counts, 'tf_analysis/pubmed.counts.rds')
+
+pubmed.counts = readRDS('tf_analysis/pubmed.counts.rds')
+t(t(sort(unlist(pubmed.counts[pubmed.counts>0]))))
+```
+
+```{r}
+system.time({
+  pubmed.counts = lapply(tf.show, function(gene){
+  pubmed_command <- paste0("curl -s 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=", gene, "+%22amacrine%22' | grep '<Count>' | sed -e 's/<Count>//' -e 's/\\s*<\\/Count>//'")
+  result <- system(pubmed_command, intern = TRUE)
+  as.numeric(ExtractString(result, before = '<eSearchResult>', after = '<RetMax>'))
+}) %>% setNames(tf.show)
+  })
+
+# Doesn't store all values properly
+system.time({
+  pubmed.counts = mclapply(tf.show, function(gene){
+    pubmed_command <- paste0("curl -s 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=", gene, "+%22amacrine%22' | grep '<Count>' | sed -e 's/<Count>//' -e 's/\\s*<\\/Count>//'")
+    result <- system(pubmed_command, intern = TRUE)
+    as.numeric(ExtractString(result, before = '<eSearchResult>', after = '<RetMax>'))
+  }, mc.cores = 20, mc.cleanup = FALSE) %>% setNames(tf.show)
+})
+
+t(t(sort(unlist(pubmed.counts[pubmed.counts>0]))))
+```
+
+Enrichment test
+
+```{r}
+# All TFs
+all.tfs = names(pubmed.counts)
+mentioned.tfs = names(pubmed.counts[pubmed.counts > 0])
+# Used: tfs.use
+mentioned.used = intersect(tfs.use, mentioned.tfs)
+VennDiagram(mentioned.tfs, tfs.use)
+
+t(t(sort(unlist(pubmed.counts[names(pubmed.counts) %in% tfs.use]))))
+```
+
+# Enrichment for protein-protein interactions
+
+## Cooperativity events
+
+```{r, fig.height=2, fig.width=4}
+tf.switches.clean = readRDS('tf_analysis/tf.switches.clean.rds')
+
+library(STRINGdb)
+
+# Setup
+db <- STRINGdb$new(species=10090, score_threshold = 0, version="12")
+
+# Run it all in a batch
+genes <- unique(unlist(tf.switches.clean))
+map <- db$map(data.frame(symbol = genes), "symbol", removeUnmappedRows=TRUE)
+
+# Get interactions
+interactions <- db$get_interactions(map$STRING_id)
+
+# Merge to get symbols back
+merged <- merge(
+    interactions,
+    map[, c("STRING_id", "symbol")],
+    by.x="from", by.y="STRING_id", all.x=TRUE
+)
+
+merged <- merge(
+    merged,
+    map[, c("STRING_id", "symbol")],
+    by.x="to", by.y="STRING_id", all.x=TRUE,
+    suffixes = c("_from", "_to")
+)
+
+PrettyHistogram2(merged$combined_score, vline = c(400, 700))
+
+# 2.4k / 2 = 1.2k interactions (each is given twice)
+
+merged.unique = unique(merged)
+
+# How many interactions are predicted using our tree? 
+ints.list = lapply(tf.switches.clean, function(x) subset(merged.unique, symbol_from %in% x & symbol_to %in% x))
+ints.all = do.call(rbind, ints.list)
+saveRDS(ints.all, 'tf_analysis/ints.all.rds')
+ints = (subset(ints.all, combined_score > 400))
+# They need not be unique, since we want to count interactions at muliple sites in the tree
+# Found 43 interactions
+
+# Scramble the list, while keeping the structure and repeat
+null.dist = sapply(1:10000, function(i){
+  shuffled_list = shuffle_values(tf.switches.clean)
+  ints.list = lapply(shuffled_list, function(x) subset(merged.unique, symbol_from %in% x & symbol_to %in% x))
+  ints.all = do.call(rbind, ints.list)
+  ints = (subset(ints.all, combined_score > 400)) 
+  nrow(ints)
+})
+```
+
+
+```{r, fig.height=2, fig.width=4}
+observed = nrow(ints)
+PrettyHistogram2(null.dist, vline = observed, bins = 20, line.col = 'deeppink', 
+                 fill = 'white', xlab = 'Significant protein-protein interactions') +
+  ArialFont()
+ggsave('../../figures/my_figs/fig-ppi-hist.pdf')
+message('permutation p-value: ', (sum(null.dist >= observed) + 1)/(length(null.dist) + 1))
+```
+
+## Novel roles for known transcriptional modules
+
+```{r, fig.height=4, fig.width=7}
+#' Run check point 2 first 
+pubmed.counts = unlist(readRDS('tf_analysis/pubmed.counts.rds'))
+ints.all = readRDS('tf_analysis/ints.all.rds')
+
+ints.all$refs_from = pubmed.counts[ints.all$symbol_from]
+ints.all$refs_to = pubmed.counts[ints.all$symbol_to]
+ints.all$refs_min = apply(ints.all[,c('refs_from', 'refs_to')], 1, min)
+ints.all$label = paste0(ints.all$symbol_from, '-', ints.all$symbol_to)
+ints.all$label[ints.all$combined_score < 400] = ''
+
+# ScatterPlot(unique(ints.all), x = 'combined_score', y = 'refs_min', labels = 'label', max.overlaps = 100) + 
+#   geom_vline(xintercept = c(400), linetype = 'dashed', color = 'deeppink')
+
+# Add expression correlations
+expr.mat = LogAvgExpr(ac.ortho, group.by = 'type', assay = 'RNA')
+cor.mat = cor(t(expr.mat[tfs.use,]))
+ints.all$expr.cor = apply(ints.all, 1, function(x) cor.mat[x[['symbol_from']], x[['symbol_to']]])
+
+ScatterPlot(unique(ints.all), 
+            x = 'expr.cor', 
+            y = 'combined_score', 
+            fill = 'expr.cor',
+            pt.col = 'black',
+            # labels = 'label', 
+            xlab = 'Expression correlation', 
+            ylab = 'PPI score',
+            max.overlaps = 5, 
+            pt.size = 1.5,
+            # pt.shape = 21,
+            label.size = 3) + 
+  theme_cowplot()+
+  NoLegend()+
+  scale_fill_gradient2(low = 'cyan2', mid = 'grey', high = 'deeppink', midpoint = 0)+
+  geom_hline(yintercept = c(400), linetype = 'dashed', color = 'grey') + 
+  geom_text_repel(aes(label = label), fontface = 'italic', family = 'ArialMT', size = 2.5) + 
+  ArialFont()
+
+ggsave('../../figures/my_figs/fig-ppi-cor.pdf', width = 6.5, height = 3)
+```
+
+
+
+```{r, fig.height=3}
+ClusteredDotplot2(ac.ortho, 
+                  features = c('NEUROD1', 'ONECUT1', 'ZEB1', 'ZEB2', 'TBX3', 'PBX1', 'MEIS1', 'MEIS2', 'PBX3'), 
+                  group.by = 'type_clean', 
+                  cluster_columns = dend,
+                  max.pct = 40, 
+                  dot.scale.factor = 0.65, 
+                  pseudocount = 5, 
+                  rotate = FALSE, 
+                  species.size = 0.40, 
+                  show.legend = FALSE, 
+                  show_row_names = TRUE, 
+                  show_row_dend = FALSE, 
+                  border_gp = gpar(col = "black", lwd = 3),
+                  column_names_side = 'top')
+
+DotPlot3(mouse.ac, features = c('NOS1', 'LHX9'))
+```
+
+

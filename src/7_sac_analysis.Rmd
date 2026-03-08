@@ -1,0 +1,1375 @@
+---
+title: "Sub-cluster SACs"
+output:
+  html_document:
+    keep_md: true
+    toc: true
+date: "2023-07-28"
+params:
+  OT: FALSE
+  manual_annotation: list(Mouse = 2, Rat = 0, Peromyscus = c(2,3), Squirrel = 1, Rhabdomys = 1, TreeShrew = 1, Cow = 0, Sheep = 0, Opossum = 1, Chicken = 0, Lizard = 1, Zebrafish = 0, Killifish = 1, Lamprey = 1)
+  color1: 'deeppink'
+  color2: 'orange'
+---
+
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 12, fig.height = 8, dev = 'png', dpi = 300)
+source("../../utils/dario_functions.R")
+LoadLibraries(load.lisi = FALSE)
+SourceFiles()
+
+ON_SAC_markers = c("FEZF1", 'FEZF2', "GFRA3", "CNTN5", "SLIT2")
+OFF_SAC_markers = c("TENM3", "ZFHX3", "RND3")
+```
+
+# Using OrthoType analysis fails 
+
+We reach the batch correction limit
+
+```{r, eval = params$OT}
+mammalAC = readRDS('../../Ortho_Objects/mammalAC_v2.rds')
+# subsetMammalAC = subset(mammalAC, species %in% c("Rat", "Peromyscus", "Squirrel", "Rhabdomys", "TreeShrew", "Cow", "Sheep", "Chicken", "Lizard", "Lamprey") & lit_type == "SAC")
+subsetMammalAC = ClusterSeurat(subsetMammalAC, integrate.by = "species", cluster_resolution = 0.1)
+
+# Find resolution
+DefaultAssay(subsetMammalAC) = "integrated"
+plotClusterRes(subsetMammalAC, from = 0.05, to = 1, by = 0.05)
+subsetMammalAC = FindClusters(subsetMammalAC, resolution = 0.05)
+
+# Plot
+DefaultAssay(subsetMammalAC) = "RNA"
+BrowseSeurat(subsetMammalAC, batch = "species")
+FeaturePlot(subsetMammalAC, features = c(ON_SAC_markers, OFF_SAC_markers))
+```
+
+Split by quality, not ON and OFF
+
+```{r, eval = params$OT}
+verterbateAC = readRDS('../../Ortho_Objects/vertebrateAC_v2.rds')
+# subsetVertAC = subset(verterbateAC, species %in% c("Rat", "Peromyscus", "Squirrel", "Rhabdomys", "TreeShrew", "Cow", "Sheep", "Chicken", "Lizard", "Lamprey") & lit_type == "SAC")
+subsetVertAC = ClusterSeurat(subsetVertAC, integrate.by = "species", cluster_resolution = 0.2)
+DefaultAssay(subsetVertAC) = "integrated"
+subsetVertAC = FindClusters(subsetVertAC, resolution = 0.4)
+DefaultAssay(subsetVertAC) = "RNA"
+BrowseSeurat(subsetVertAC, batch = "species")
+FeaturePlot(subsetVertAC, features = c(ON_SAC_markers, OFF_SAC_markers))
+
+# Score
+subsetVertAC = ScaleData(subsetVertAC, features = c(OnSacMarkers, OffSacMarkers))
+subsetVertAC$ON.SAC.score = ScoreCelltype(subsetVertAC, OnSacMarkers)
+subsetVertAC$OFF.SAC.score = ScoreCelltype(subsetVertAC, OffSacMarkers)
+plotSACMarkers(subsetVertAC)
+```
+
+# Read in species data
+
+```{r, fig.height=4, fig.width=8}
+# No SACs found in ferret due to low sampling of ACs, will omit
+speciesList = phylogenetic_order2[!phylogenetic_order2 %in% c("Ferret", 'Goldfish')]
+objectList = lapply(speciesList, function(species) {
+    if(species == "Mouse") {
+      readRDS("../../Species_Reference/MouseACref_v4.rds")
+    } else if(species == 'Zebrafish'){
+      readRDS("../../Species_Objects/ZebrafishAC_no_HCs_v6_converted.rds")
+    } else {
+      readRDS(paste0("../../Species_Objects/", species, "AC_v6.rds"))
+    }
+  })
+names(objectList) = speciesList
+
+objectList$Killifish = readRDS('../../Species_Objects/Killifish_ncbiAC_v6.rds')
+objectList$Killifish = UpperCase_genes(objectList$Killifish)
+```
+
+## Annotate ON and OFF SACs
+
+Some naturally split into two clusters:
+
+* Squirrel
+* Rat
+* Rhabdomys
+
+The rest need a supervised approach: 
+
+* Get DE genes between ON and OFF SACs
+* Score each cell
+* Use Gaussian mixture models to define valid cutpoints
+
+## Find useful genes
+
+Using mouse P0 from Peng et al. 2020
+
+```{r}
+PengAC = readRDS("../../Species_Reference/PengAC_v3.rds")
+BrowseSeurat(PengAC, batch = "batch")
+# Cluster 0 = ON SACs
+# Cluster 1 = OFF SACs
+PengAC$lit_type = ifelse(PengAC$seurat_clusters == 0, "ON", "OFF")
+Idents(PengAC) = "lit_type"
+
+plotSACMarkers(PengAC, feature.plot = TRUE)
+```
+
+```{r}
+PengMarkers = wilcoxauc(PengAC, 'seurat_clusters')
+OnSacMarkers = subset(PengMarkers, group == 0 & logFC > 0.25 & padj < 0.001)$feature
+OffSacMarkers = subset(PengMarkers, group == 1 & logFC > 0.25 & padj < 0.001)$feature
+
+OnSacMarkers
+OffSacMarkers
+```
+
+## Score the cells (average z-scored expression)
+
+```{r}
+# Subset to SACs
+SACList = lapply(seq_along(objectList), function(index) {
+  print(names(objectList)[[index]])
+  subset(objectList[[index]], lit_type == "SAC")
+})
+names(SACList) = speciesList
+
+# Add mouse with only Yan SACs to avoid batch effects 
+# mouseAC = readRDS("../../Species_Reference/MouseACref_v4.rds")
+SACList$Mouse = subset(SACList$Mouse, lit_type == "SAC" & source == "Yan")
+
+ScoredList = lapply(SACList, function(object){
+  object = AssignName(object)
+  object = ScaleData(object, features = c(OnSacMarkers, OffSacMarkers))
+  object$ON.SAC.score = ScoreCelltype(object, OnSacMarkers)
+  object$OFF.SAC.score = ScoreCelltype(object, OffSacMarkers)
+  return(object)
+})
+```
+
+# Successful ON and OFF SAC annotations
+
+## Mouse
+
+Poor separation between ON and OFF
+
+```{r, fig.height=5, fig.width=8, eval = TRUE}
+ScoredList$Mouse = SubclusterSACs(ScoredList$Mouse, group.by = "batch", resolution = 0.3, harmonize = FALSE)
+
+# Remove the bad quality cells
+ScoredList$Mouse = subset(ScoredList$Mouse, seurat_clusters %in% c(1,2))
+```
+
+## Rat
+
+```{r}
+ScoredList$Rat = SubclusterSACs(ScoredList$Rat, resolution = 0.1)
+```
+
+## Peromyscus 
+
+```{r}
+ScoredList$Peromyscus = SubclusterSACs(ScoredList$Peromyscus, resolution = 0.1)
+```
+
+## Squirrel
+
+```{r}
+ScoredList$Squirrel = SubclusterSACs(ScoredList$Squirrel, resolution = 0.1)
+```
+
+## Rhabdomys
+
+```{r}
+ScoredList$Rhabdomys = SubclusterSACs(ScoredList$Rhabdomys, group.by = "orig.file", resolution = 0.1)
+```
+
+## Treeshrew 
+
+```{r}
+ScoredList$TreeShrew = SubclusterSACs(ScoredList$TreeShrew, resolution = 0.1)
+```
+
+## Cow
+
+```{r}
+ScoredList$Cow = SubclusterSACs(ScoredList$Cow, resolution = 0.1)
+```
+
+## Sheep
+
+```{r}
+ScoredList$Sheep = SubclusterSACs(ScoredList$Sheep, resolution = 0.08)
+```
+
+## Opossum
+
+```{r}
+ScoredList$Opossum = SubclusterSACs(ScoredList$Opossum, resolution = 0.08)
+
+# Remove the bad quality cells
+ScoredList$Opossum = subset(ScoredList$Opossum, seurat_clusters %in% c(0,1))
+```
+
+## Chicken
+
+```{r}
+ScoredList$Chicken = SubclusterSACs(ScoredList$Chicken, resolution = 0.2, group.by = "orig.file")
+```
+
+## Lizard
+
+```{r}
+ScoredList$Lizard = SubclusterSACs(ScoredList$Lizard, resolution = 0.1, group.by = "orig.file")
+```
+
+## Zebrafish
+
+```{r}
+ScoredList$Zebrafish = SubclusterSACs(subset(ScoredList$Zebrafish, sample == 'LD_14D'), resolution = 0.1, group.by = "sample", harmonize = FALSE)
+# DimPlotLabeled(ScoredList$Zebrafish, group.by = 'sample')
+# DimPlotLabeled(ClusterSeurat(subset(ScoredList$Zebrafish, sample == 'Control_2'), cluster_resolution = 0.1))
+```
+
+## Killifish
+
+```{r}
+# Convert to zebrafish symbols 
+ScoredList$Killifish = RenameFeatures(ScoredList$Killifish, gsub('ZFHX3B', 'ZFHX3', gsub('RND3A', 'RND3', rownames(ScoredList$Killifish))))
+ScoredList$Killifish = SubclusterSACs(ScoredList$Killifish, resolution = 0.1, group.by = "alias", harmonize = TRUE)
+
+# VlnPlot(ScoredList$Killifish, features = c('TENM3', 'ZFHX3B', 'RND3A'))
+```
+
+## Lamprey
+
+The MSTRG ID for TENM3 is MSTRG.4792 and the LOC ID is LOC116944204.
+
+```{r}
+LampreySAC = ScoredList$Lamprey
+LampreySAC = Harmonize(LampreySAC, batch = "orig.file", cluster_resolution = 0.1, show.plots = FALSE)
+BrowseSeurat(LampreySAC, batch = "orig.file")
+LampreySAC = TransferSACLabels(LampreySAC)
+FeaturePlot(LampreySAC, features = c("LOC116944204", "FEZF2"))
+rownames(LampreySAC@assays$RNA@counts)[rownames(LampreySAC@assays$RNA@counts) == "LOC116944204"] = "TENM3"
+rownames(LampreySAC@assays$RNA@data)[rownames(LampreySAC@assays$RNA@data) == "LOC116944204"] = "TENM3"
+ScoredList$Lamprey = LampreySAC
+```
+
+# Failures
+
+## Human
+
+```{r}
+ScoredList$Human = SubclusterSACs(ScoredList$Human, group.by = "donor")
+```
+
+## Macaque
+
+```{r}
+ScoredList$Macaque = SubclusterSACs(ScoredList$Macaque)
+```
+
+## Marmoset
+
+```{r}
+ScoredList$Marmoset = SubclusterSACs(ScoredList$Marmoset, resolution = 0.5)
+```
+
+## Mouse lemur
+
+Separate by quality
+
+```{r}
+ScoredList$MouseLemur = SubclusterSACs(ScoredList$MouseLemur, resolution = 0.8)
+```
+
+## Pig
+
+Separate into two clusters but not ON and OFF
+
+```{r}
+ScoredList$Pig = SubclusterSACs(ScoredList$Pig, resolution = 0.4)
+```
+
+
+```{r}
+pigac = readRDS('../../Species_Objects/PigAC_v6.rds')
+pigsacs = subset(pigac, type == '14_SAC')
+pigsacs
+
+pigsacs = ClusterSeurat(pigsacs, cluster_resolution = 1)
+DimPlotLabeled(pigsacs)
+FeaturePlot(pigsacs, c('TENM3', 'ZFHX3', 'FEZF1'))
+DotPlot(pigsacs, features = c('TENM3', 'ZFHX3', 'RND3', 'TLE1', 'FEZF1', 'FEZF2'))
+```
+
+## Save 
+
+```{r, eval = FALSE}
+saveRDS(ScoredList, "../../Species_Reference/ScoredSacList.rds")
+```
+
+Addition of zebrafish and lizard
+
+```{r}
+ze = ScoredList$Zebrafish
+ScoredList_old = readRDS("../../Species_Reference/ScoredSacList.rds")
+ScoredList_old$Zebrafish = ScoredList$Zebrafish
+saveRDS(ScoredList_old, "../../Species_Reference/ScoredSacList_v2.rds")
+```
+
+Addition of re-aligned lizard
+
+```{r}
+ScoredList = readRDS("../../Species_Reference/ScoredSacList_v2.rds")
+
+# Run lizard again with v6 object before saving
+saveRDS(ScoredList, "../../Species_Reference/ScoredSacList_v3.rds")
+```
+
+Addition of killifish
+
+```{r}
+ScoredList = readRDS("../../Species_Reference/ScoredSacList_v3.rds")
+
+# Run killifish
+ScoredList$Lizard = lizard
+ScoredList = append(ScoredList, list(Killifish = kfish), after = 17)
+saveRDS(ScoredList, "../../Species_Reference/ScoredSacList_v4.rds")
+```
+
+# Summary
+
+Checkpoint
+
+```{r}
+manual_annotation = eval(parse(text = params$manual_annotation))
+
+# options(ggplot2.discrete.colour = list(c("red3", "gold")), 
+        # ggplot2.discrete.fill = list(c("red3", "gold")))
+```
+
+```{r}
+ScoredList = readRDS("../../Species_Reference/ScoredSacList_v4.rds")
+
+successful_species = names(manual_annotation)
+successList = ScoredList[names(ScoredList) %in% successful_species]
+successList = lapply(seq_along(successList), function(index){
+  species = names(successList)[[index]]
+  on_sac_clusters = manual_annotation[[species]]
+  successList[[index]]$lit_subtype = "OFF"
+  successList[[index]]$lit_subtype[successList[[index]]$seurat_clusters %in% on_sac_clusters] = "ON"
+  return(successList[[index]])
+  })
+names(successList) = names(ScoredList[names(ScoredList) %in% successful_species])
+```
+
+## UMAP
+
+```{r sac-umap, fig.height=9, fig.width=15}
+spacer = 0.1
+angle.list = c(0, 0, 0, 120, -70, 170, 135, 0, 0,-45, 160, -60, -90, 130) * pi/180
+umap.list = lapply(seq_along(successList), function(index) 
+  # theme_umap(DimPlot(successList[[index]], group.by = "lit_subtype", label = TRUE), #cols = c(params$color1, params$color2), pt.size = 0.5), 
+             # remove.axes = FALSE, title = names(successList)[[index]]) + 
+  TitlePlot(PrettyUmap2(successList[[index]], group.by = 'lit_subtype', label = TRUE, 
+                        pad = 1, geom.label = geom_label, color = 'black', fill = 'white', 
+                      pt.alpha = 1, label.size = 0, alpha = 0.8, label.padding = unit(0, "lines"), 
+                      label.r = unit(0.2, "lines"), angle = angle.list[[index]]), 
+            names(successList)[[index]])+
+    theme(plot.margin = unit(c(spacer, spacer, spacer, spacer), "cm")))
+# ggarrange(plotlist = umap.list, ncol = 5, nrow = 3, common.legend = TRUE, legend = "right")
+ggarrange(plotlist = PrepStack(plt.list = umap.list, ncol = 5, nrow = 3), 
+          ncol = 5, nrow = 3, common.legend = TRUE, legend = "right", align = 'hv')
+ggsave("../../figures/my_figs/sac-umap-1.pdf", width=15/1.4, height = 9/1.4)
+```
+
+# Scatter plots
+
+```{r sac-cor, fig.height=12, fig.width=16}
+scatterplot.list = lapply(seq_along(successList), function(index){
+                      object = successList[[index]]
+                      avg_exp = as.data.frame(log1p(AverageExpression(object, verbose = FALSE, group.by = "lit_subtype")$RNA))
+                      p1 = ExpressionScatter(avg_exp, x = "ON", y="OFF", logX = FALSE, logY = FALSE, 
+                                             genes.to.label = c("TENM3", "ZFHX3", "RND3", "FEZF1", "FEZF2"), 
+                                             title = names(successList)[[index]])
+                      return(p1)
+})
+
+ggarrange(plotlist = scatterplot.list, ncol = 5, nrow = 3) %>% suppressWarnings()
+```
+
+# ON and OFF type dotplot
+
+```{r, fig.height=5, fig.width=11}
+merged <- merge(successList[[1]], y = successList[2:length(successList)], add.cell.ids = names(successList))
+
+# merged = Reduce(merge, successList)
+merged$species = rep(names(successList), sapply(successList, ncol))
+
+# DimPlot(merged, split.by = "species", group.by = "lit_subtype", cols = c("blue", "red"))
+```
+
+```{r sac-violin, fig.height=7, fig.width=6}
+# Scale by species
+split = SplitObject(merged, split.by = "species")
+merged$`FEZF1_FEZF2` = unlist(lapply(split, function(object) rescale(object@assays$RNA@data["FEZF1",]+object@assays$RNA@data["FEZF2",])))
+merged$`TENM3_ZFHX3_RND3` = unlist(lapply(split, function(object) rescale(object@assays$RNA@data["TENM3",]+object@assays$RNA@data["ZFHX3",]+object@assays$RNA@data["RND3",])))
+merged$species = factor(merged$species, levels = rev(phylogenetic_order2))
+
+plot_grid(VlnPlot(merged, 
+                  features = c("FEZF1_FEZF2", "TENM3_ZFHX3_RND3"), 
+                  group.by = "species", 
+                  cols = c(params$color1, params$color2),
+                  split.by = "lit_subtype", 
+                  split.plot = FALSE, 
+                  pt.size = 0, 
+                  stack = TRUE) + NoLegend() + theme(axis.title.y = element_blank()), 
+          stackedBarGraph(merged, feature.2 = "species", feature.1 = "lit_subtype") + 
+            labs(y = 'Proportion')+
+            guides(fill = guide_legend(title = "Subtype"))+
+            # scale_fill_manual(values = c(params$color1, params$color2))+
+            coord_flip() + 
+            theme(axis.text.y = element_blank(), axis.title.y = element_blank()), 
+          ncol = 2, rel_widths = c(1.2,1), align = "h", axis = "bt")
+
+ggsave('../../figures/my_figs/sac-violn-1.pdf', height = 7.5, width = 6)
+# VlnPlot(merged, split.by = "lit_subtype", features = c("FEZF1", "FEZF2", OFF_SAC_markers), group.by = "species", split.plot = FALSE, ncol = 5)
+# VlnPlot(merged, split.by = "lit_subtype", features = c("ON.SAC.score", "OFF.SAC.score"), group.by = "species", split.plot = FALSE, ncol = 5)
+# ggsave("../../figures/files/sac-violin-1.png", height=4.5, width = 8)
+```
+
+
+```{r}
+saveRDS(merged, '../../Ortho_Objects/sac-merged_v1.rds')
+```
+
+# Cross-species analysis of ON and OFF SACs
+
+```{r, fig.height=5, fig.width=5}
+BIGSEURAT = readRDS("../../Ortho_Objects/vertebrateAC_BIGSEURAT.rds")
+merged = readRDS('../../Ortho_Objects/sac-merged_v1.rds')
+BIGSEURAT$lit_subtype = merged$lit_subtype[match(Cells(BIGSEURAT), Cells(merged))]
+
+sac_subset = subset(BIGSEURAT, lit_subtype %in% c('ON', 'OFF'))
+table(sac_subset$species)
+saveRDS(sac_subset, '../../Ortho_Objects/sac_subset_v4.rds')
+```
+
+```{r, fig.height=3, fig.width=7}
+sac_subset = readRDS('../../Ortho_Objects/sac_subset_v3.rds')
+# de.on.off = FindAllMarkersFast(sac_subset, group.by = 'lit_subtype')
+de.on.off = FindMarkersFast(sac_subset, group.by = 'lit_subtype', ident.1 = 'ON', ident.2 = 'OFF', p_val_adj_cutoff = 1, avg_log2FC_cutoff = 0)
+
+# geneDotPlot(sac_subset, 'TENM3', group.by = 'lit_subtype')
+# geneDotPlot(sac_subset, 'TRHDE', group.by = 'lit_subtype')
+# geneDotPlot(sac_subset, 'LRP1B', group.by = 'lit_subtype')
+
+merged$species_rev = factor(merged$species, levels = (phylogenetic_order))
+VlnPlot(merged, features = c('TENM3', 'ZFHX3', 'TRHDE', 'LRP1B', 'POU6F2'), group.by = "species", cols = c(params$color1, params$color2), split.by = "lit_subtype", split.plot = FALSE, pt.size = 0, stack = TRUE)
+VlnPlot(merged, features = c('ADGRL2', 'KIRREL3', 'TLE1'), group.by = "species", cols = c(params$color1, params$color2), split.by = "lit_subtype", split.plot = FALSE, pt.size = 0, stack = TRUE, flip = TRUE)
+
+VlnPlot(merged, features = c('TENM3', 'ADGRL2'), group.by = "species_rev", cols = c(params$color1, params$color2), split.by = "lit_subtype", split.plot = FALSE, pt.size = 0, stack = TRUE, flip = TRUE)
+```
+
+```{r, fig.height=5, fig.width=7}
+sac_subset = readRDS('../../Ortho_Objects/sac_subset_v4.rds')
+# de.on.off = FindAllMarkersFast(sac_subset, group.by = 'lit_subtype')
+de.on.off = FindMarkersFast(DownsampleSeurat(sac_subset, group.by = c('species', 'lit_subtype'), size = 50), group.by = 'lit_subtype', ident.1 = 'ON', ident.2 = 'OFF', p_val_adj_cutoff = 1, avg_log2FC_cutoff = 0)
+
+# volcanoPlot(de.on.off, fc_cutoff = 0.25, fdr_cutoff = 0.01, labels = TRUE, max.overlaps = 100, size = 2, max_fdr = 1e-10)
+subset(de.on.off, gene == 'ADGRL2')
+subset(de.on.off, gene == 'SLIT2')
+
+# pdf('../../figures/my_figs/sac-volcano-plot.pdf', height = 5, width = 7)
+TitlePlot(volcanoPlot(de.on.off, 
+                      fc_cutoff = 0.25, 
+                      fdr_cutoff = 0.01, 
+                      labels = TRUE, 
+                      max.overlaps = 10, 
+                      max_fdr = 1e-11, 
+                      color.signif = 'deeppink',
+                      name1 = 'OFF-enriched', 
+                      name2 = 'ON-enriched', 
+                      anno.y = 0.4), 'ON vs OFF SAC')
+# dev.off()
+ggsave('../../figures/my_figs/sac-volcano-plot-2.pdf', height = 5, width = 7)
+```
+
+## Module score
+
+```{r, fig.height=6, fig.width=8}
+rownames(de.on.off) = de.on.off$gene
+on_genes <- nDEGs(de.on.off, up = TRUE, down = FALSE, log2FC.threshold = 0.25, p_val_adj.threshold = 0.05, value = TRUE)
+off_genes <- nDEGs(de.on.off, up = FALSE, down = TRUE, log2FC.threshold = 0.25, p_val_adj.threshold = 0.05, value = TRUE)
+sac_subset <- AddModuleScore(sac_subset, features = list(on_genes), name="ON_SAC_score")
+# DimPlot(sac_subset, split.by = 'species', group.by = 'lit_subtype')
+
+write.csv(on_genes, 'specificity_analysis/on_sac_genes.csv')
+write.csv(off_genes, 'specificity_analysis/off_sac_genes.csv')
+
+umap.list = lapply(seq_along(successList), function(index) {
+  successList[[index]] = AddModuleScore(successList[[index]], features = list(off_genes), name="OFF_SAC_score")
+  successList[[index]] = AddModuleScore(successList[[index]], features = list(on_genes), name="ON_SAC_score")
+  successList[[index]]$SAC_SCORE = successList[[index]]$ON_SAC_score1 - successList[[index]]$OFF_SAC_score1
+  theme_umap(ClusterFeaturePlot(successList[[index]], group.by = 'lit_subtype', features = 'SAC_SCORE'), 
+             remove.axes = FALSE, title = names(successList)[[index]])
+  })
+ggarrange(plotlist = umap.list, ncol = 4, nrow = 3, common.legend = TRUE, legend = "right")
+```
+
+## Correlation between log2FC of ON vs OFF SACs across species
+
+```{r, fig.height=7, fig.width=7}
+sac_subset = readRDS('../../Ortho_Objects/sac_subset.rds')
+genes.of.interest = c('FEZF1', 'FEZF2', 'TENM3', 'ZFHX3', 'RND3')
+```
+
+
+```{r, fig.height=7, fig.width=7}
+obj1 = subset(sac_subset, species == 'Cow')
+obj2 = subset(sac_subset, species == 'Sheep')
+
+de1 = FindMarkersFast(obj1, group.by = 'lit_subtype', ident.1 = 'ON', ident.2 = 'OFF', p_val_adj_cutoff = 1, avg_log2FC_cutoff = 0)
+de2 = FindMarkersFast(obj2, group.by = 'lit_subtype', ident.1 = 'ON', ident.2 = 'OFF', p_val_adj_cutoff = 1, avg_log2FC_cutoff = 0)
+
+logfc_dat = merge(de1, de2, by = 'gene')
+logfc_dat$label = logfc_dat$gene
+logfc_dat$label[!logfc_dat$label %in% genes.of.interest] = NA
+
+ScatterPlot(logfc_dat, 'avg_log2FC.x', 'avg_log2FC.y', labels = 'label', max.overlaps = Inf, label_func = geom_label_repel)
+```
+
+# TLE1 conservation
+
+## Discovery in mouse P0
+
+```{r, fig.height=4, fig.width=4}
+peng_sac = readRDS("../../Species_Reference/PengAC_v3.rds")
+peng_sac$annotated = factor(peng_sac$annotated, levels = c("OFF", "ON"))
+# peng_sac$annotated = ifelse(peng_sac$seurat_clusters == 0, "ON", "OFF")
+# Idents(peng_sac) = "annotated"
+de.sac = FindMarkers(peng_sac, ident.1 = "ON", ident.2 = "OFF")
+ExpressionScatter(peng_sac, x = "ON", y = "OFF", genes.to.label = c("FEZF1", "TENM3", "ZFHX3", "RND3", "TLE1"))
+```
+
+```{r, fig.height=4, fig.width=4}
+ClusterFeaturePlot(peng_sac, features = "TLE1")
+DotPlot2(peng_sac, features = "TLE1")
+VlnPlot(peng_sac, features = "TLE1", group.by = 'annotated')
+```
+
+## Adult mouse
+
+```{r, fig.height=4, fig.width=4}
+Idents(successList$Mouse) = "lit_subtype"
+ClusterFeaturePlot(successList$Mouse, features = "TLE1")
+DotPlot2(successList$Mouse, features = "TLE1")
+# successList$Mouse$lit_subtype = factor(successList$Mouse$lit_subtype, levels = c("OFF", "ON"))
+VlnPlot(successList$Mouse, features = "TLE1", group.by = "lit_subtype")
+```
+
+## Other species
+
+```{r, fig.height=12, fig.width=10}
+ggarrange(plotlist = lapply(names(successList), function(species) {
+  tryCatch(TitlePlot(VlnPlot(successList[[species]], features = c("TLE1"), group.by = "lit_subtype"), species), error=function(e) NULL)
+  }), common.legend = TRUE, legend = 'right'
+)
+```
+
+# Tenuerin-3 and latrophilin-2
+
+## BCs: OFF BCs
+
+```{r, fig.height=4, fig.width=7}
+bc.ortho = readRDS('../../Ortho_Objects/vertebrateBC_BIGSEURAT.rds')
+bc.ortho$species = factor(bc.ortho$species, levels = phylogenetic_order)
+geneDotPlotFast(bc.ortho, gene = 'TENM3', group.by = 'NOG')
+ggsave('../../figures/my_figs/bc-tenm3.pdf', width = 6, height = 3)
+geneDotPlotFast(bc.ortho, gene = 'ADGRL2', group.by = 'NOG') # latrophilin 2
+ggsave('../../figures/my_figs/bc-adgrl2.pdf', width = 6, height = 3)
+```
+
+How surprising is this? 
+
+```{r}
+BIGSEURAT = readRDS('../../Ortho_Objects/vertebrateAC_BIGSEURAT.rds')
+gene2go = fread('../../reference_files/human_gene2go_symbol.csv')
+
+neurotransmitter = c(gene2go[grepl("neurotransmitter", gene2go$GoTerm)]$Symbol %>% unique %>% sort, 'GAD1', 'GAD2')
+connexins = sort(rownames(BIGSEURAT)[grepl('^GJA|^GJB|^GJC|^GJD|^GJE', rownames(BIGSEURAT))])
+# adhesion = intersect(sort(str_split(fread('../../reference_files/KEGG_CELL_ADHESION_MOLECULES_CAMS.v2023.2.Hs.tsv')$KEGG_CELL_ADHESION_MOLECULES_CAMS[17], ',')[[1]]), rownames(BIGSEURAT))
+subset(gene2go, Symbol == 'TENM3')
+subset(gene2go, Symbol == 'ADGRL2')
+adhesion = sort(intersect(c(gene2go[gene2go$GoID == 'GO:0005886']$Symbol %>% unique %>% sort), rownames(BIGSEURAT)))
+adhesion
+```
+
+
+```{r, fig.height=5, fig.width=8, dpi=300, dev = 'CairoPNG'}
+bc.ortho = readRDS('../../Ortho_Objects/vertebrateBC_BIGSEURAT.rds')
+bc.conservation.summary = readRDS('../../Ortho_Objects/bc.conservation.summary.rds')
+bc.ortho$species_NOG = paste0(bc.ortho$species, '-', bc.ortho$NOG)
+
+# Remove genes with no expression
+# datExpr = datExpr[goodSamplesGenes(t(datExpr))$goodGenes,]
+# dim(datExpr)
+
+# Keep only genes expressed robustly 
+# good.genes = SelectFeatures(bc.ortho, group.by = 'NOG', features = rownames(datExpr))
+# datExpr = datExpr[good.genes,]
+# dim(datExpr)
+
+# Keep only conserved genes 
+good.genes = sort(bc.conservation.summary$gene[which(bc.conservation.summary$cor.score > 0.3)])
+
+# test for anticorrelated cell adhesion molecules in BCs
+# datExpr = LogAvgExpr(bc.ortho, group.by = 'species_NOG', assay = 'RNA', features = good.genes)
+# dim(datExpr)
+
+# Use species-normalized log-normalized and scaled expression values
+matrix.list = readRDS("../../Ortho_Objects/BC_OT_expression_log1p_scaled.rds")
+matrix.list.subset = matrix.list[good.genes]
+
+# adhesion.cor = outer(matrix.list.subset, matrix.list.subset, function(x, y) {
+#   print(x)
+#   cor(as.vector(as.matrix(x)), as.vector(as.matrix(y)), use = 'complete.obs')
+#   }) # cor(t(datExpr))
+
+compute.cor <- function(matrix.list.subset) {
+  # Initialize an empty matrix to store the correlation results
+  cor_matrix <- matrix(NA, nrow = length(matrix.list.subset), ncol = length(matrix.list.subset), 
+                       dimnames = list(names(matrix.list.subset), names(matrix.list.subset)))
+  
+  # Loop over all pairs of matrices in the list
+  for (i in 1:length(matrix.list.subset)) {
+    for (j in 1:length(matrix.list.subset)) {
+      x <- matrix.list.subset[[i]]
+      y <- matrix.list.subset[[j]]
+      
+      # Print the matrices being compared (optional)
+      # print(list(x = x, y = y))
+      
+      # if(names(matrix.list.subset)[[i]] == 'B3GNT2' & names(matrix.list.subset)[[j]] == 'ABCA4') browser()
+      
+      # Compute the correlation between the vectorized matrices
+      cor_matrix[i, j] <- cor(as.vector(as.matrix(x)), as.vector(as.matrix(y)), use = 'complete.obs')
+    }
+  }
+  
+  return(cor_matrix)
+}
+
+adhesion.cor = compute.cor(matrix.list.subset)
+diag(adhesion.cor) = NA
+adhesion.cor[upper.tri(adhesion.cor)] = NA
+cor.df = reshape2::melt(adhesion.cor) %>% setNames(c('Gene1', 'Gene2', 'Correlation'))
+
+cor.df$number = 1:nrow(cor.df)
+cor.df = subset(cor.df, !is.na(Correlation)) %>% arrange(desc(Correlation))
+
+# top10.pos = head(cor.df, 20) %>% pull(gene.combination)
+# top10.neg = head(cor.df %>% arrange(Correlation), 20) %>% pull 
+
+MultigeneDotPlot(bc.ortho, genes = c('ISL1', 'GRM6', 'GNB3'), group.by = 'NOG')
+MultigeneDotPlot(bc.ortho, genes = c('XKR4', 'ZBTB20'), group.by = 'NOG')
+MultigeneDotPlot(bc.ortho, genes = c('DSCAM', 'DSCAML1'), group.by = 'NOG')
+MultigeneDotPlot(bc.ortho, genes = c('ZEB2', 'NTNG1'), group.by = 'NOG')
+
+cor.df$gene.combination = paste(cor.df$Gene1, '-' , cor.df$Gene2)
+# cor.df$rand.number = runif(nrow(cor.df))
+
+compute_pvalues <- function(correlations, sample_sizes) {
+  # Initialize an empty vector to store p-values
+  p_values <- numeric(length(correlations))
+  
+  # Loop over the correlations and sample sizes to compute p-values
+  for (i in 1:length(correlations)) {
+    r <- correlations[i]
+    n <- sample_sizes[i]
+    
+    # Compute t statistic
+    t_value <- (r * sqrt(n - 2)) / sqrt(1 - r^2)
+    
+    # Compute p-value using the t-distribution with df = n - 2
+    p_values[i] <- 2 * pt(-abs(t_value), df = n - 2)  # Two-tailed test
+  }
+  
+  return(p_values)
+}
+
+cor.df$p.value = compute_pvalues(cor.df$Correlation, rep(181, nrow(cor.df)))
+cor.df$p.adj = p.adjust(cor.df$p.value)
+cor.df$rank = rank(abs(cor.df$Correlation))
+
+ggscatter(cor.df, x = 'number', y = 'Correlation', label = 'gene.combination', font.label = c(2, "plain"), size = 1, repel = FALSE) + 
+  theme(axis.text.x = element_blank(), plot.margin = unit(c(1,1,1,1), units = 'in'), axis.ticks = element_blank()) +
+  scale_x_discrete(expand = expansion(mult = c(0.01,0.01)))+
+  xlab('Gene combinations')+
+  theme_dario()
+
+top.genes = head(cor.df %>% arrange(p.adj), 50)
+
+pdf('specificity_analysis/bc-cor-anticor-genes.pdf', height = 5, width = 6)
+for(i in 1:nrow(top.genes)){
+  print(MultigeneDotPlot(bc.ortho, genes = as.character(c(top.genes$Gene1[[i]], top.genes$Gene2[[i]])), group.by = 'NOG'))
+}
+dev.off()
+
+cor.df = cor.df %>% arrange(p.adj)
+saveRDS(cor.df, '../../Ortho_Objects/bc-cor-anticor-df.rds')
+```
+
+```{r, fig.height=3, fig.width=8, dpi=300, dev = 'CairoPNG'}
+HistogramAnnotation(PrettyHistogram(cor.df$Correlation, xlab = 'Correlation'), 'p = 4.3e-34', subset(cor.df, gene.combination == 'TENM3 - ADGRL2')$Correlation, linetype = 'dashed')
+```
+
+String interaction
+
+```{r}
+alias.db = fread('~/Downloads/9606.protein.aliases.v12.0.txt')
+gene.key = as.data.frame(alias.db[,c('#string_protein_id', 'alias')] %>% unique %>% arrange(alias))
+subset(gene.key, alias == 'TENM3')
+# nrow(unique(gene.key[,1]))
+# nrow(unique(gene.key[,2]))
+string.db = fread('~/Downloads/9606.protein.links.v12.0.txt')
+head(string.db)
+
+query_stringdb = function(gene1, gene2){
+  # Not all proteins will be found
+  df = subset(string.db, protein1 == subset(gene.key, alias == gene1)[1,1] & protein2 == subset(gene.key, alias == gene2)[1,1])
+  df$gene1 = gene1
+  df$gene2 = gene2
+  if(nrow(df) > 0) df else data.frame(matrix(NA, nrow = 1, ncol = 5)) %>% setNames(colnames(df))
+}
+
+# All significant interactions (1589)
+cor.df = readRDS('../../Ortho_Objects/bc-cor-anticor-df.rds')
+cor.df.sig = subset(cor.df, p.adj < 1e-6)
+
+# options(warn = 2)         # Treat warnings as errors
+# options(error = recover)
+string.res = do.call(rbind, apply(cor.df.sig, 1, function(x) {
+  print(x['gene.combination'])
+  query_stringdb(x['Gene1'], x['Gene2'])
+  }))
+
+cor.df.sig$Interaction = string.res$combined_score/1000
+cor.df.sig$direction = ifelse(cor.df.sig$Correlation > 0, '+', '-')
+cor.df.sig$gene.combination = gsub(' - ', '/', cor.df.sig$gene.combination)
+
+ScatterPlot(cor.df.sig, x = 'Correlation', y = 'Interaction', r_pval = FALSE, lm = FALSE, 
+            labels = 'gene.combination', fill = 'direction', ylab = 'Protein interaction score', max.overlaps = 10) + 
+  scale_fill_manual(name = 'Direction', values = c('red', 'blue')) +
+  geom_hline(yintercept = c(0.4, 0.7, 0.9), linetype = 'dashed', color = c('lightgrey', 'grey', 'black'))
+
+
+top.genes = subset(cor.df.sig, Interaction > 0.7)
+pdf('specificity_analysis/bc-cor-anticor-genes-interaction.pdf', height = 5, width = 6)
+for(i in 1:nrow(top.genes)){
+  print(MultigeneDotPlot(bc.ortho, genes = as.character(c(top.genes$Gene1[[i]], top.genes$Gene2[[i]])), group.by = 'NOG'))
+}
+dev.off()
+```
+
+```{r, fig.height=6, fig.width=20}
+plot_grid(MultigeneDotPlot(bc.ortho, c('DSCAM', 'DSCAML1'), group.by = 'NOG', no.legend = TRUE), 
+          MultigeneDotPlot(ac.ortho, c('DSCAM', 'DSCAML1'), no.legend = TRUE), 
+          MultigeneDotPlot(rgc.ortho, c('DSCAM', 'DSCAML1'), group.by = 'NOG'), 
+          nrow = 1, rel_widths = c(1,2,1.5), labels = c('BC', 'AC', 'RGC'))
+```
+
+
+```{r, fig.height=20, fig.width=5}
+MultigeneDotPlot(bc.ortho, c('TENM3', 'ADGRL2', 'UNC5D', 'FLRT3', 'DSCAM', 'DSCAML1', 'SDK1', 'SDK2'), group.by = 'NOG')
+```
+
+
+```{r, fig.height=16, fig.width=20}
+plot_grid(MultigeneDotPlot(bc.ortho, c('TENM1', 'TENM2', 'TENM3', 'TENM4', 'ADGRL1', 'ADGRL2', 'ADGRL3'), group.by = 'NOG', no.legend = TRUE), 
+          MultigeneDotPlot(ac.ortho, c('TENM1', 'TENM2', 'TENM3', 'TENM4', 'ADGRL1', 'ADGRL2', 'ADGRL3'), no.legend = TRUE), 
+          MultigeneDotPlot(rgc.ortho, c('TENM1', 'TENM2', 'TENM3', 'TENM4', 'ADGRL1', 'ADGRL2', 'ADGRL3'), group.by = 'NOG'), 
+          nrow = 1, rel_widths = c(1,2,1.5), labels = c('BC', 'AC', 'RGC'))
+```
+
+Slit and ROBO
+
+```{r, fig.height=16, fig.width=20}
+bc.ortho = readRDS('../../Ortho_Objects/vertebrateBC_BIGSEURAT.rds')
+ac.ortho = readRDS('../../Ortho_Objects/vertebrateAC_BIGSEURAT.rds')
+rgc.ortho = readRDS('../../Ortho_Objects/vertebrateRGC_BIGSEURAT.rds')
+
+plot_grid(MultigeneDotPlot(bc.ortho, c('SLIT1', 'SLIT2', 'SLIT3', 'ROBO1', 'ROBO2', 'ROBO3', 'ROBO4'), group.by = 'NOG', no.legend = TRUE), 
+          MultigeneDotPlot(ac.ortho, c('SLIT1', 'SLIT2', 'SLIT3', 'ROBO1', 'ROBO2', 'ROBO3', 'ROBO4'), no.legend = TRUE), 
+          MultigeneDotPlot(rgc.ortho, c('SLIT1', 'SLIT2', 'SLIT3', 'ROBO1', 'ROBO2', 'ROBO3', 'ROBO4'), group.by = 'NOG'), 
+          nrow = 1, rel_widths = c(1,2,1.5), labels = c('BC', 'AC', 'RGC'))
+```
+
+## ACs
+
+```{r, fig.height=10, fig.width=8}
+ac.ortho = LoadAC()
+MultigeneDotPlot(ac.ortho, c('TENM3', 'ADGRL2', 'DSCAM', 'DSCAML1'))
+```
+
+## SACs
+
+```{r, fig.height=4, fig.width=10}
+bc.ortho = readRDS('../../Ortho_Objects/vertebrateBC_BIGSEURAT.rds')
+sac_subset = readRDS('../../Ortho_Objects/sac_subset_v4.rds')
+sac_subset$subtype = factor(paste0(sac_subset$lit_subtype, ' SAC'), levels = c('ON SAC', 'OFF SAC'))
+
+plot_grid(
+  (geneDotPlotFast(sac_subset, gene = 'TENM3', group.by = 'subtype') + NoLegend() | 
+  geneDotPlotFast(sac_subset, gene = 'ADGRL2', group.by = 'subtype') + NoLegend() + theme(axis.text.y = element_blank())), 
+  (geneDotPlotFast(bc.ortho, group.by = 'NOG', gene = 'TENM3') + NoLegend() | 
+    geneDotPlotFast(bc.ortho, group.by = 'NOG', gene = 'ADGRL2') + theme(axis.text.y = element_blank())), 
+  nrow = 1, rel_widths = c(1,3), align = 'h', axis = 'bt'
+  )
+ggsave('../../figures/my_figs/tenm3-adgrl2-sac-bc.pdf', height=4, width=10)
+```
+
+## RGCs: broad expression
+
+C10 is low TENM3 and projects to ON IPL
+C18 is ON and low 
+Check 25 and 26
+
+Doesn't seem to be a big effect in RGCs
+
+```{r, fig.height=12, fig.width=8}
+rgc.ortho = readRDS('../../Ortho_Objects/vertebrateRGC_BIGSEURAT.rds')
+MultigeneDotPlot(rgc.ortho, c('TENM3', 'ADGRL2', 'DSCAM', 'DSCAML1', 'DCC'), group.by = 'NOG')
+
+
+mouse.rgc = readRDS('../../HahnObjects/RGCs/MouseRGC_integrated_v2.rds')
+DotPlot2(mouse.rgc, features = 'TENM3')
+```
+
+# ON vs OFF RGCs
+
+```{r, fig.height=4, fig.width=11}
+rgc.prop = read.csv('../RGC/RGC subclasses - Sheet1.csv')
+rgc.prop
+
+on.types = setdiff(as.vector(str_split_fixed(ExtractString(c(rgc.prop$ON.sustained, rgc.prop$ON.transient), after = ' '), '/', 2)), '')
+off.types = setdiff(ExtractString(c(rgc.prop$OFF.sustained, rgc.prop$OFF.transient), after = ' '), '')
+on.types
+off.types
+
+mouse.rgc = readRDS('../../HahnObjects/RGCs/MouseRGC_integrated_v2.rds')
+mouse.rgc$annotated2 = ExtractString(mouse.rgc$annotated, after = '_')
+mouse.rgc$polarity = ifelse(mouse.rgc$annotated2 %in% on.types, 'ON', ifelse(mouse.rgc$annotated2 %in% off.types, 'OFF', 'other'))
+mouse.rgc$annotated2 = factor(mouse.rgc$annotated2, levels = Metadata(mouse.rgc, 'polarity', 'annotated2')$annotated2)
+
+TitlePlot(DotPlot3(mouse.rgc, features = c('TENM3', 'ADGRL2', 'DSCAM', 'DSCAML1', 'SDK1', 'SDK2', 'FLRT3', 'UNC5D'), group.by = 'annotated2') +
+  geom_hline(yintercept = cumsum(as.vector(table(Metadata(mouse.rgc, 'polarity', 'annotated2')$polarity))) + 0.5),
+  'OFF                             ON                                                      other                          ')
+```
+
+# Co-embedding with more cells
+
+```{r}
+BIGSEURAT = readRDS('../../Ortho_Objects/vertebrateAC-allcells-counts.rds')
+BIGSEURAT = RenameCells(BIGSEURAT, add.cell.id = BIGSEURAT$species)
+merged = readRDS('../../Ortho_Objects/sac-merged_v1.rds')
+BIGSEURAT = RenameCells(BIGSEURAT, new.names = paste0(BIGSEURAT$species, '_', BIGSEURAT$Cell))
+BIGSEURAT$lit_subtype = merged$lit_subtype[match(Cells(BIGSEURAT), Cells(merged))]
+sac_subset = subset(BIGSEURAT, lit_subtype %in% c('ON', 'OFF'))
+table(sac_subset$species)
+saveRDS(sac_subset, '../../Ortho_Objects/sac_subset_v5.rds')
+```
+
+
+```{r}
+cow_sheep = subset(sac_subset, species %in% c('Cow', 'Sheep'))
+cow_sheep = ClusterSeurat(cow_sheep, integrate.by = 'species')
+DimPlot(cow_sheep, group.by = 'lit_subtype')
+
+rodents = subset(sac_subset, species %in% c('Mouse', 'Rhabdomys', 'Rat', 'Peromyscus', 'Squirrel'))
+rodents = ClusterSeurat(rodents, integrate.by = 'species')
+DimPlot(rodents, group.by = 'lit_subtype')
+DefaultAssay(rodents) = 'integrated'
+rodents = FindClusters(rodents, resolution = 0.01)
+DimPlotLabeled(rodents)
+
+# Add the primates
+primates = subset(BIGSEURAT, species %in% c('Human', 'Macaque', 'Marmoset') & type == '8_SAC*')
+primates = ClusterSeurat(primates, integrate.by = 'species')
+DimPlotLabeled(primates)
+
+# Coembedding fails
+pr_rd = merge(primates, rodents)
+pr_rd = ClusterSeurat(pr_rd, integrate.by = 'species')
+DimPlot(pr_rd, group.by = 'lit_subtype')
+
+sac_subset = ClusterSeurat(sac_subset, integrate.by = 'species')
+DimPlot(sac_subset, group.by = 'lit_subtype')
+DefaultAssay(sac_subset) = 'integrated'
+sac_subset = FindClusters(sac_subset, resolution = 0.3)
+DimPlotLabeled(sac_subset)
+```
+
+# LDA
+
+```{r}
+# -----------------------------------------------------------
+# LDA on the iris dataset
+# -----------------------------------------------------------
+
+library(MASS)
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+
+# -----------------------------------------------------------
+# 1. Load data
+# -----------------------------------------------------------
+df <- iris
+head(df)
+
+# -----------------------------------------------------------
+# 2. Fit Linear Discriminant Analysis
+# -----------------------------------------------------------
+lda_model <- lda(Species ~ ., data = df)
+
+# Variance explained by each LDA axis
+prop_var <- lda_model$svd^2 / sum(lda_model$svd^2)
+round(prop_var, 3)
+
+# Project data into LDA space
+lda_proj <- predict(lda_model)$x
+lda_df <- data.frame(lda_proj, Species = df$Species)
+
+# -----------------------------------------------------------
+# 3. Plot LDA projection
+# -----------------------------------------------------------
+p_lda <- ggplot(lda_df, aes(LD1, LD2, color = Species)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "LDA projection of iris data",
+    x = paste0("LD1 (", round(prop_var[1] * 100, 1), "% var)"),
+    y = paste0("LD2 (", round(prop_var[2] * 100, 1), "% var)")
+  ) +
+  scale_color_brewer(palette = "Dark2")
+
+# -----------------------------------------------------------
+# 4. Compare with PCA projection
+# -----------------------------------------------------------
+pca_res <- prcomp(df[, 1:4], scale. = TRUE)
+pca_df <- data.frame(pca_res$x[, 1:2], Species = df$Species)
+
+p_pca <- ggplot(pca_df, aes(PC1, PC2, color = Species)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "PCA projection of iris data",
+    x = paste0("PC1 (", round(summary(pca_res)$importance[2, 1] * 100, 1), "% var)"),
+    y = paste0("PC2 (", round(summary(pca_res)$importance[2, 2] * 100, 1), "% var)")
+  ) +
+  scale_color_brewer(palette = "Dark2")
+
+# -----------------------------------------------------------
+# 5. Display side-by-side
+# -----------------------------------------------------------
+gridExtra::grid.arrange(p_pca, p_lda, ncol = 2)
+
+```
+
+```{r, fig.height=4, fig.width=10}
+RunLDA(iris[,1:4], iris[,1:4], iris$Species)
+
+rodents_minus = subset(rodents, species == 'Squirrel', invert = TRUE)
+squirrel = subset(rodents, species == 'Squirrel')
+squirrel.lda = RunLDA(rodents_minus@reductions$pca@cell.embeddings, squirrel@reductions$pca@cell.embeddings, rodents_minus$lit_subtype)
+
+# Works marvelously
+EvaluateModel(table(squirrel.lda[[2]]$class, squirrel$lit_subtype))
+
+PrettyHistogram2(squirrel.lda[[2]]$x[,1])
+```
+
+## In the primate/rodent integrated space
+
+```{r, fig.height=4, fig.width=10}
+# Train on rodents
+train_rodents = subset(pr_rd, species %in% c('Human', 'Macaque', 'Marmoset'), invert = TRUE)
+
+# Test on primates
+test_primates = subset(pr_rd, species %in% c('Human', 'Macaque', 'Marmoset'), invert = FALSE)
+
+# Run LDA
+rodent.primate.lda = RunLDA(train_rodents@reductions$pca@cell.embeddings, test_primates@reductions$pca@cell.embeddings, train_rodents$lit_subtype)
+rodent.lda = rodent.primate.lda[[1]]
+primate.lda = rodent.primate.lda[[2]]
+
+PrettyHistogram2(rodent.lda$x[,1])
+
+train_rodents$lda.class = rodent.lda$class
+train_rodents$posterior = rodent.lda$posterior[,1]
+train_rodents$ld1 = rodent.lda$x[,1]
+
+test_primates$lda.class = primate.lda$class
+test_primates$posterior = primate.lda$posterior[,1]
+test_primates$ld1 = primate.lda$x[,1]
+# hist(subset(test_primates, species %in% c('Human'))$ld1)
+# hist(subset(test_primates, species %in% c('Macaque'))$ld1)
+
+pseudo.mat = as.data.frame(primate.lda$x)
+pseudo.mat[['LD2']] = rnorm(nrow(primate.lda$x))
+
+test_primates[["lda"]] <- CreateDimReducObject(
+  embeddings = as.matrix(pseudo.mat),
+  key = "lda_",
+  assay = DefaultAssay(test_primates)
+)
+
+PrettyHistogram2(subset(test_primates, species %in% c('Human'))$ld1)
+PrettyHistogram2(subset(test_primates, species %in% c('Macaque'))$ld1)
+PrettyHistogram2(subset(test_primates, species %in% c('Marmoset'))$ld1)
+
+PrettyHistogram2(subset(test_primates, species %in% c('Human'))$posterior)
+PrettyHistogram2(subset(test_primates, species %in% c('Macaque'))$posterior)
+PrettyHistogram2(subset(test_primates, species %in% c('Marmoset'))$posterior)
+
+DotPlot3(test_primates, features = c('TENM3', 'ZFHX3', 'RND3', 'FEZF1', 'FEZF2'), group.by = 'lda.class')
+
+PrettyHistogram2(subset(train_rodents, lda.class == 'ON' & species %in% c('Rat'))$ld1, subset(train_rodents, lda.class == 'OFF' & species %in% c('Rat'))$ld1)
+PrettyHistogram2(subset(test_primates, lda.class == 'ON')$ld1, subset(test_primates, lda.class == 'OFF')$ld1)
+
+barplot(col_norm(table(test_primates$lda.class, test_primates$species)))
+saveRDS(test_primates, '../../Ortho_Objects/test_primates-v1.rds')
+```
+
+Jitter them and make the hue proportional to the posterior
+
+```{r, fig.height=3, fig.width=7}
+test_primates$lda.class.filt = ifelse(test_primates$posterior < 0.2 | test_primates$posterior > 0.8, as.character(test_primates$lda.class), NA)
+DimPlot(test_primates, split.by = 'species', group.by = 'lda.class.filt', reduction = 'lda')
+FeaturePlot(test_primates, split.by = 'species', reduction = 'lda', features = 'TENM3', order = TRUE)
+FeaturePlot(test_primates, split.by = 'species', reduction = 'lda', features = 'ZFHX3', order = TRUE)
+
+dat.sum = cbind(as.data.frame(test_primates@reductions$lda@cell.embeddings), 
+                lda.class = test_primates$lda.class, 
+                posterior = test_primates$posterior, 
+                species = test_primates$species)
+dat.sum$score = abs(dat.sum$posterior-0.5) + 0.5 # transform so that its the posterior of the best class
+
+table(test_primates$lda.class.filt, test_primates$species)
+```
+
+
+```{r, fig.height=2.5, fig.width=8}
+ggscatter(dat.sum, 'lda_1', 'lda_2', facet.by = 'species', color = 'lda.class', alpha = 'score', size = 1, shape = 16) + 
+  ylab('') + 
+  xlab('LD 1')+
+  ArialFont()+
+  scale_alpha_continuous(name = 'Posterior', range = c(0, 0.8))+
+  guides(color = "none")+
+  theme(axis.text.x = element_blank(), 
+        axis.text.y = element_blank(),
+        # plot.subtitle = element_text(size = 20),
+        axis.ticks = element_blank(), 
+        legend.position = 'right',
+        strip.background = element_blank(),  # removes the grey rectangle
+        strip.text = element_text(color = "black", size = 12)) # keep the text) + 
+
+ggsave('../../figures/my_figs/fig-primate-sac.pdf')
+```
+
+## One primate at a time? 
+
+```{r}
+LDA_on_primate = function(this.species){
+  
+  exclude = setdiff(c('Human', 'Macaque', 'Marmoset'), this.species)
+  rodent_marmoset = subset(pr_rd, species %in% exclude, invert = TRUE)
+  rodent_marmoset = ClusterSeurat(rodent_marmoset, integrate.by = 'species')
+  DimPlotLabeled(rodent_marmoset, group.by = 'lit_subtype')
+  
+  # LDA
+  rodents_minus = subset(rodent_marmoset, species == this.species, invert = TRUE)
+  this_species = subset(rodent_marmoset, species == this.species)
+  this.lda = RunLDA(rodents_minus@reductions$pca@cell.embeddings, this_species@reductions$pca@cell.embeddings, rodents_minus$lit_subtype)
+  
+  print(table(this.lda[[2]]$class)) # 65:35 ratio
+  
+  
+  rodent.lda = this.lda[[1]]
+  rodents_minus$lda.class = rodent.lda$class
+  rodents_minus$posterior = rodent.lda$posterior[,1]
+  rodents_minus$ld1 = rodent.lda$x[,1]
+  
+  primate.lda = this.lda[[2]]
+  this.lda$lda.class = primate.lda$class
+  this.lda$posterior = primate.lda$posterior[,1]
+  this.lda$ld1 = primate.lda$x[,1]
+
+  list(rodent.lda, primate.lda)
+}
+
+# Only 99 cells in mouse lemur
+
+marmoset.lda = LDA_on_primate('Marmoset')
+macaque.lda = LDA_on_primate('Macaque') 
+human.lda = LDA_on_primate('Human') # gives more OFF than ON, not expected
+```
+
+## Projection into the rodent integrated space
+
+```{r}
+# Scale all data
+loadings = rodents@reductions$pca@feature.loadings
+primates = ScaleData(primates, features = rownames(primates))
+scale.data = primates@assays$RNA@scale.data
+
+# Subset to rodent genes (hopefully rodent genes are resistant to batch effects)
+common.genes = rodents@assays$integrated@var.features
+scale.data.common = scale.data[common.genes,]
+
+# 2000 x 50
+query.pca.embeddings <- Matrix::t(scale.data.common) %*% loadings
+primates[["pca_rodent"]] <- CreateDimReducObject(
+  embeddings = as.matrix(query.pca.embeddings),
+  key = "PC_",
+  assay = DefaultAssay(primates)
+)
+
+DimPlot(primates, reduction = 'pca_rodent', group.by = 'species')
+DimPlot(rodents, reduction = 'pca', group.by = 'species') | DimPlot(rodents, reduction = 'pca', group.by = 'lit_subtype')
+```
+
+# Summarize with clade panels
+
+## Primates
+
+```{r, fig.height=3.5, fig.width=4}
+BIGSEURAT = readRDS('../../Ortho_Objects/vertebrateAC-allcells-counts.rds')
+BIGSEURAT = RenameCells(BIGSEURAT, add.cell.id = BIGSEURAT$species)
+sac_subset = readRDS('../../Ortho_Objects/sac_subset_v5.rds')
+
+primateSAC = subset(BIGSEURAT, species %in% species_metadata$Species[species_metadata$Clade == 'Primate'] & type == '8_SAC*')
+
+# Balance species
+primateSAC = DownsampleSeurat(primateSAC, 'species', size = 300)
+primateSAC = ClusterSeurat(primateSAC, integrate.by = 'species')
+PrettyUmap2(primateSAC, group.by = 'species', cols = species_palette3, 
+            label = FALSE, show.legend = TRUE, pad = 0.4) + 
+  LegendLowerLeft() 
+saveRDS(primateSAC, '../../Ortho_Objects/primateSAC.rds')
+```
+
+## Rodents
+
+```{r}
+rodentSAC = subset(sac_subset, species %in% species_metadata$Species[species_metadata$Clade == 'Rodent'])
+
+# Balance species
+rodentSAC = DownsampleSeurat(rodentSAC, 'species', size = 1000)
+rodentSAC = ClusterSeurat(rodentSAC, integrate.by = 'species')
+DimPlot(rodentSAC, group.by = 'species', cols = species_palette3) | DimPlot(rodentSAC, group.by = 'lit_subtype')
+saveRDS(rodentSAC, '../../Ortho_Objects/rodentSAC.rds')
+```
+
+## Laurasia
+
+```{r, fig.height=4, fig.width=6}
+# lauraSAC = subset(BIGSEURAT, species %in% species_metadata$Species[species_metadata$Clade == 'Laurasiatheria'] & type == '8_SAC*')
+lauraSAC = subset(sac_subset, species %in% species_metadata$Species[species_metadata$Clade == 'Laurasiatheria'])
+lauraSAC = MapBack(lauraSAC, sac_subset, group.by = 'lit_subtype')
+
+# Remove ferret and pig (too few cells)
+lauraSAC = subset(lauraSAC, species %in% c('Ferret', 'Pig'), invert = TRUE)
+
+# Balance species
+lauraSAC = DownsampleSeurat(lauraSAC, 'species', size = 1000)
+lauraSAC = ClusterSeurat(lauraSAC, integrate.by = 'species', numPCs = 5)
+DimPlot(lauraSAC, group.by = 'species', cols = species_palette3) | DimPlot(lauraSAC, group.by = 'lit_subtype')
+saveRDS(lauraSAC, '../../Ortho_Objects/lauraSAC.rds')
+```
+
+# Other mammals
+
+```{r}
+otherSAC = subset(sac_subset, species %in% c('Opossum', 'TreeShrew'))
+
+# Balance species
+table(otherSAC$species)
+otherSAC = DownsampleSeurat(otherSAC, 'species', size = 1000)
+otherSAC = ClusterSeurat(otherSAC, integrate.by = 'species')
+DimPlot(otherSAC, group.by = 'species', cols = species_palette3) | DimPlot(otherSAC, group.by = 'lit_subtype')
+saveRDS(otherSAC, '../../Ortho_Objects/otherSAC.rds')
+```
+
+## Sauropsids 
+
+```{r, fig.height=4, fig.width=6}
+# squaSAC = subset(BIGSEURAT, species %in% species_metadata$Species[species_metadata$Clade == 'Squamate'] & type == '8_SAC*')
+squaSAC = subset(sac_subset, species %in% species_metadata$Species[species_metadata$Clade == 'Sauropsid'])
+# squaSAC = MapBack(squaSAC, sac_subset, group.by = 'lit_subtype')
+
+# Balance species
+table(squaSAC$species)
+squaSAC = DownsampleSeurat(squaSAC, 'species', size = 500)
+squaSAC = ClusterSeurat(squaSAC, integrate.by = 'species', numPCs = 10)
+DimPlot(squaSAC, group.by = 'species', cols = species_palette3) | DimPlot(squaSAC, group.by = 'lit_subtype')
+DimPlotLabeled(squaSAC)
+saveRDS(squaSAC, '../../Ortho_Objects/sauroSAC.rds')
+```
+
+
+## Amphibians
+
+```{r}
+axolotl = readRDS('../../Species_Objects/AxolotlAC_v6.rds')
+newt = readRDS('../../Species_Objects/NewtAC_v6.rds')
+
+DotPlot3(axolotl, features = 'CHAT', group.by = 'type')
+DotPlot3(newt, features = 'CHAT', group.by = 'type')
+
+ax.SAC = subset(axolotl, type %in% c('gabaAC-1', 'gabaAC-17'))
+newt.SAC = subset(newt, type %in% c('gabaAC-1', 'gabaAC-14'))
+
+# Integrate with 12k common genes
+common.genes = intersect(rownames(ax.SAC), rownames(newt.SAC))
+amph.SAC = merge(ax.SAC, newt.SAC)
+amph.SAC = SubsetSeuratGenes(amph.SAC, common.genes)
+amph.SAC = ClusterSeurat(amph.SAC, integrate.by = 'species', numPCs = 20)
+DimPlot(amph.SAC, group.by = 'species', cols = species_palette3) | DimPlotLabeled(amph.SAC)
+DimPlot(amph.SAC, group.by = 'species', reduction = 'pca', cols = species_palette3)
+FeaturePlot(amph.SAC, features = c(ON_SAC_markers, OFF_SAC_markers))
+
+# Contamination in cluster 2
+DotPlot3(amph.SAC, features = Genes(major_annotation))
+
+amph.SAC = subset(amph.SAC, seurat_clusters == 2, invert = T)
+DimPlot(amph.SAC, group.by = 'species', cols = species_palette3) | DimPlotLabeled(amph.SAC)
+saveRDS(amph.SAC, '../../Ortho_Objects/amph.SAC.rds')
+```
+
+
+## Zebrafish only
+
+```{r}
+objectList = list()
+# objectList$Killifish = readRDS('../../Species_Objects/Killifish_ncbiAC_v6.rds')
+objectList$Zebrafish = readRDS('../../Species_Objects/ZebrafishAC_no_HCs_v6_converted.rds')
+ze = readRDS('../../Full_Objects/Zebrafish_lyu_full_v2.rds')
+# cbind(rownames(objectList$Zebrafish), rownames(ze))
+
+# Rename zebrafish symbols
+objectList$Zebrafish = RenameFeatures(objectList$Zebrafish, rownames(ze))
+SAC.2 = subset(objectList$Zebrafish, lit_type %in% c('SAC') & sample %in% c('LD_14D'))
+SAC.2$species = 'Zebrafish'
+SAC.2 = ClusterSeurat(SAC.2) # Harmonize(SAC.2, batch = 'sample')
+DimPlotLabeled(SAC.2) | DimPlotLabeled(SAC.2, group.by = 'sample')
+saveRDS(SAC.2, '../../Ortho_Objects/zeSAC.rds')
+```
+
+## Zebrafish and killifish
+
+Killifish struggles to split well
+
+```{r}
+objectList = list()
+objectList$Killifish = readRDS('../../Species_Objects/Killifish_ncbiAC_v6.rds')
+objectList$Zebrafish = readRDS('../../Species_Objects/ZebrafishAC_no_HCs_v6_converted.rds')
+ze = readRDS('../../Full_Objects/Zebrafish_lyu_full_v2.rds')
+# cbind(rownames(objectList$Zebrafish), rownames(ze))
+
+# Rename zebrafish symbols
+objectList$Zebrafish = RenameFeatures(objectList$Zebrafish, rownames(ze))
+SAC.2 = subset(objectList$Zebrafish, lit_type %in% c('SAC') & sample %in% c('LD_14D'))
+SAC.2$species = 'Zebrafish'
+SAC.2 = ClusterSeurat(SAC.2) # Harmonize(SAC.2, batch = 'sample')
+DimPlotLabeled(SAC.2) | DimPlotLabeled(SAC.2, group.by = 'sample')
+ 
+# Annotate killifish SACs
+# objectList$Killifish = AssignAnnotations(objectList$Killifish, list(SAC = 'AC-1'), use = 'annotated')
+```
+
+
+```{r}
+SAC.1 = subset(objectList$Killifish, lit_type == 'SAC') # & animal %in% c('SRR27923005', 'SRR27923006')) # 11, 17
+FeaturePlot(objectList$Killifish, features = 'sox2') | DimPlotLabeled(objectList$Killifish)
+SAC.1$species = 'Killifish'
+SAC.1 = ClusterSeurat(SAC.1, numPCs = 10)
+# SAC.1 = Harmonize(SAC.1, batch = 'animal') # subset(SAC.1, animal %in% c('SRR27923003', 'SRR27923004')))
+DimPlotLabeled(SAC.1) | DimPlotLabeled(SAC.1, group.by = 'animal')
+FeaturePlot(SAC.1, features = c(tolower(ON_SAC_markers), tolower(OFF_SAC_markers), 'zfhx3b'))
+# DotPlot3(SAC.1, features = Genes(major_annotation_pr_ze))
+# DotPlot3(SAC.1, features = c('slc5a7a', 'chata', 'slc6a9', 'sox2', 'tenm3', 'fezf1'))
+
+SAC.2 = subset(objectList$Zebrafish, lit_type %in% c('SAC')) # & sample %in% c('Control_2'))
+SAC.2$species = 'Zebrafish'
+SAC.2 = ClusterSeurat(SAC.2) #Harmonize(SAC.2, batch = 'sample')
+DimPlotLabeled(SAC.2) | DimPlotLabeled(SAC.2, group.by = 'sample')
+FeaturePlot(SAC.2, features = c(tolower(ON_SAC_markers), tolower(OFF_SAC_markers)))
+# FeaturePlot(SAC.2, features = c('chata', 'slc5a7a', 'slc6a9'))
+# DimPlotLabeled(objectList$Zebrafish) | FeaturePlot(objectList$Zebrafish, features = 'megf11')
+# DimPlotLabeled(objectList$Zebrafish, group.by = 'lit_type')
+
+# Load orthology graphs
+ze2kf = readRDS('../cones/orthology_graphs/ze2kf.rds')
+int = OrthotypeAnalysis2(SAC.2, list(SAC.1), homologyList = list(t(ze2kf)), 
+                   group.by = 'type', # doesn't matter  
+                   numPCs = 10,
+                   downsample = 10000 # no downsampling
+                   )
+FeaturePlot(int, features = c(tolower(ON_SAC_markers), tolower(OFF_SAC_markers), 'zfhx3b'))
+DimPlot(int, group.by = 'species', cols = species_palette3) | DimPlotLabeled(int)
+```
+
+## Shark and lamprey
+
+Shark doesn't split
+
+```{r}
+objectList$Shark = readRDS('../../Species_Objects/SharkAC_v6.rds')
+sh2ze = readRDS('../cones/orthology_graphs/sh2ze.rds')
+
+SAC.1 = subset(objectList$Shark, type == 'gabaAC-3')
+# SAC.1 = Harmonize(SAC.1, batch = 'animal')
+SAC.1 = ClusterSeurat(SAC.1, integrate.by = 'animal')
+DimPlotLabeled(SAC.1)
+FeaturePlot(SAC.1, features = c(tolower(ON_SAC_markers), tolower(OFF_SAC_markers)))
+```
+
+## Zebrafish and lamprey
+
+```{r}
+objectList$Lamprey = readRDS('../../Full_Objects/Lamprey_Wang_full_v2.rds')
+DotPlot3(objectList$Lamprey, features = 'CHAT', group.by = 'annotated')
+pm2ze = readRDS('../cones/orthology_graphs/pm2ze.rds')
+objectList$Lamprey = ConvertGeneSymbols2(objectList$Lamprey, pm2ze)
+
+SAC.pm = subset(objectList$Lamprey, annotated %in% paste0('gabaAC-', 1:4))
+SAC.pm = Harmonize(SAC.pm, batch = 'animal')
+DimPlotLabeled(SAC.pm) | DimPlot(SAC.pm, group.by = 'animal')
+FeaturePlot(SAC.pm, features = c(tolower(ON_SAC_markers), tolower(OFF_SAC_markers)), order = F)
+DotPlot3(SAC.pm, features = Genes(major_annotation_pr_ze))
+VlnPlot(SAC.pm, 'nFeature_RNA')
+
+SAC.ze = subset(objectList$Zebrafish, lit_type %in% c('SAC') & sample %in% c('LD_14D'))
+SAC.ze$species = 'Zebrafish'
+SAC.ze = ClusterSeurat(SAC.ze) #Harmonize(SAC.2, batch = 'sample')
+DimPlotLabeled(SAC.ze) | DimPlotLabeled(SAC.ze, group.by = 'sample')
+FeaturePlot(SAC.ze, features = c(tolower(ON_SAC_markers), tolower(OFF_SAC_markers)))
+```
+
+Just lamprey
+
+```{r}
+SAC.pm.clean = subset(SAC.pm, seurat_clusters %in% c(4,5,6,7), invert = T)
+SAC.pm.clean = RenameFeatures(SAC.pm.clean, SAC.pm.clean@misc$orig.features)
+SAC.pm.clean$species = 'Lamprey'
+DimPlotLabeled(SAC.pm.clean)
+saveRDS(SAC.pm.clean, '../../Ortho_Objects/SAC.pm.clean.rds')
+int = OrthotypeAnalysis2(SAC.ze, list(SAC.pm.clean), homologyList = list(pm2ze), 
+                   group.by = 'type', # doesn't matter  
+                   numPCs = 10,
+                   downsample = 10000 # no downsampling
+                   )
+DimPlot(int, group.by = 'species', cols = species_palette3) | DimPlotLabeled(int)
+FeaturePlot(int, features = c(tolower(ON_SAC_markers), tolower(OFF_SAC_markers), 'zfhx3b'))
+```
+
+

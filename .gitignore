@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Google Drive temp files
+.tmp.driveupload/
+.tmp.drivedownload/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# R
+.Rhistory
+.RData
+.Rproj.user/

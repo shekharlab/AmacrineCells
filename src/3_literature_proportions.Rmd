@@ -1,0 +1,236 @@
+---
+title: "Literature proportion analysis"
+output: 
+  BiocStyle::html_document:
+    toc: true
+date: "2023-07-28"
+---
+
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source("../../utils/dario_functions.R")
+LoadLibraries()
+SourceFiles()
+```
+
+# Read in data
+
+```{r, fig.height=4, fig.width=8}
+speciesList = phylogenetic_order[phylogenetic_order %in% c("Human", "Ferret", "Lizard", "Rhabdomys", "Marmoset", "Lamprey", "Macaque", "Chicken", "MouseLemur", "Rat", "Pig", "Peromyscus")] #setdiff(unique(vertebrateAC$species), c("Mouse", "Rhabdomys", "Sheep", "Squirrel", "TreeShrew"))
+objectList = lapply(speciesList, function(species) readRDS(paste0("../../Species_Objects/", species, "AC_v5.rds")))
+names(objectList) = speciesList
+
+# Make sure enrichment group is properly assigned
+species_metadata = read.csv("../../Species_Objects/sample_metadata2.csv")
+objectList = lapply(seq_along(objectList), function(index) {
+  object = objectList[[index]]
+  if(!names(objectList)[index] %in% c("Human", "Macaque", "Marmoset")){
+    object$enrichment = toupper(str_split_fixed(species_metadata$description[match(object$orig.file, species_metadata$channel)], "_", 2)[,1])
+    object$animal = gsub("A", "", gsub("B", "", gsub("C", "", toupper(str_split_fixed(species_metadata$description[match(object$orig.file, species_metadata$channel)], "_", 2)[,2]))))
+  }
+  return(object)
+})
+names(objectList) = speciesList
+```
+
+# Validation of cell type proprotions using literature
+
+A2	Human	10-15 of total
+A2	Macaque	10-15 of total
+A2	Marmoset	10-15 of total
+KT2	Macaque	5 of total
+A8	Macaque	3-5 of total
+VG3	Rat	1 of total
+A17	Mouse	5 of total
+CA1	Human	0.1
+CA1	Macaque	0.1
+nNOS Marmoset	2.5
+
+```{r, eval = prop.differences}
+humanAC = readRDS("../../Species_Objects/HumanAC_v6.rds")
+# humanAC = objectList$Human
+human.props = getProportions(humanAC)
+
+macaqueAC = readRDS("../../Species_Objects/MacaqueAC_v6.rds")
+# macaqueAC = objectList$Macaque
+macaque.props = getProportions(macaqueAC)
+
+marmosetAC = readRDS("../../Species_Objects/MarmosetAC_v6.rds")
+# marmosetAC = objectList$Marmoset
+marmoset.props = getProportions(marmosetAC)
+
+ratAC = readRDS("../../Species_Objects/RatAC_v6.rds")
+# ratAC = objectList$Rat
+rat.props = getProportions(ratAC)
+
+# mouseAC = readRDS("../../Species_Objects/MouseAC_v6.rds")
+mouseAC = readRDS("../../Species_Reference/MouseACref_v4.rds")
+mouseAC$enrichment = NA
+mouseAC$enrichment[mouseAC$source %in% c("Tran", "Macosko")] = "NONE"
+mouse.props = getProportions(mouseAC)
+
+# Add mouse to objectList
+# objectList$Mouse = mouseAC
+```
+
+```{r lit-prop-scatter, eval = prop.differences, fig.height=3.5, fig.width=3.5}
+# A2 (human 3)
+human.A2 = human.props[[1]]["3"]
+
+# A2 (macaque 15)
+macaque.A2 = macaque.props[[1]]["15"]
+
+# A2 (marmoset 5)
+marmoset.A2 = marmoset.props[[1]]["5"]
+
+# Knotty type 2 (macaque 38)
+macaque.KT2 = macaque.props[[1]]["38"]
+
+# A8 (macaque 4)
+macaque.A8 = macaque.props[[1]]["4"]
+
+# VG3 (rat 35)
+rat.VG3 = rat.props[[1]]["35"]
+
+# CA1 (human 21)
+human.CA1 = human.props[[1]]["21"]
+
+# CA2 (macaque 43)
+macaque.CA1 = macaque.props[[1]]["43"]
+
+# nNOS (marmoset 21)
+marmoset.nNOS = marmoset.props[[1]]["24"]
+
+# SAC (mouse 7)
+mouse.SAC = mouse.props[[1]]["15"]
+
+# A17 (mouse 10)
+mouse.A17 = mouse.props[[1]]["4"]
+
+literatureProportions = data.frame(type_species = c("A2-human", "A2-macaque", "A2-marmoset", "KT2-macaque", "A8-macaque", "VG3-rat", 
+                                                    "A17-mouse", "CA1-human", "CA1-macaque", "nNOS-marmoset", "SAC-mouse"), 
+                                   `IHC` = c(0.10, 0.10, 0.10, 0.05, 0.04, 0.01, 0.05, 0.001, 0.001, 0.025, 0.052), 
+                                   `scRNAseq` = c(human.A2, macaque.A2, marmoset.A2, macaque.KT2, macaque.A8, rat.VG3, 
+                                                  mouse.A17, human.CA1, macaque.CA1, marmoset.nNOS, mouse.SAC))
+
+literatureProportions = subset(literatureProportions, type_species != "KT2-macaque")
+
+# ScatterPlot(literatureProportions,
+#             x = "IHC",
+#             y = "scRNAseq",
+#             labels = "type_species",
+#             xlab = "Literature (% total)",
+#             ylab = "scRNA-seq (% total)",
+#             title = "Cell type proportions", 
+#             lm = FALSE, r = TRUE, r_pval = FALSE)+
+#   geom_abline(slope=1, intercept = 0)+
+#   scale_x_continuous(limits = c(0,11))+
+#   scale_y_continuous(limits = c(0,11))
+
+ggplot(literatureProportions, aes(x = IHC, y = scRNAseq)) +
+  theme_cowplot()+
+  # geom_point(
+  #   data = data.frame(x = seq(0,0.1,length.out = 100), 
+  #                     y = seq(0,0.1,length.out = 100)),
+  #   aes(x, y),
+  #   alpha = 1,        # invisible
+  #   size = 3
+  # )+
+  geom_abline(slope=1, intercept = 0, color = 'lightgrey', alpha = 1, linewidth = 0.5)+
+  geom_point(color = '#584B9FFF', fill = '#584B9FFF', shape = 21, size = 2.5)+
+  xlab('IHC frequency')+
+  ylab('sc/snRNA-seq frequency')+
+  geom_text_repel(aes(label = type_species), 
+                  size = 3, 
+                  min.segment.length = 0.2)+
+                  # nudge_x = ifelse(literatureProportions$IHC > literatureProportions$scRNAseq, 0.002, -0.002))+
+  # scale_x_continuous(limits = c(0,0.11))+
+  # scale_y_continuous(limits = c(0,0.11))+
+  scale_ticks_first_last(expand = c(0.01, 0.01), limits = c(0, 0.12))+
+  scale_ticks_first_last(expand = c(0.01, 0.01), axis = 'x', limits = c(0, 0.12))+
+  stat_cor(aes(label = ..r.label..))+
+  ArialFont()
+  # coord_cartesian(clip = "off") +
+  # theme_dario()
+
+ggsave('../../figures/my_figs/lit-prop-scatter.pdf', height=3.3, width=3.5)
+# p1
+# dev.off()
+```
+
+
+```{r, fig.height=3, fig.width=6}
+# No need to read in orthotype object at the moment
+# vertebrateAC = readRDS("../../Ortho_Objects/vertebrateAC_v2.rds")
+
+# Compute proportions for each object
+proportionsList = lapply(c(objectList), getProportions)
+nCells = sapply(proportionsList, function(x) x[2])
+data.frame(nCells = unlist(nCells))
+```
+
+
+```{r, fig.height=3, fig.width=6}
+# Extract proportion vectors
+proportions = sapply(proportionsList, function(x) x[1])
+
+# Convert literature names to new versions
+objectList = lapply(objectList, function(object) {
+  object$lit_type[object$lit_type == "AII"] = "A2" 
+  object$lit_type[object$lit_type == "CA-I"] = "CA1" 
+  object$lit_type[object$lit_type == "CA-II"] = "CA2" 
+  return(object)
+})
+```
+
+## SAC proportions
+
+```{r}
+# Find best match for SACs
+PlotCelltypeProportions(objectList, proportions, "SAC", color = "red", reference.line = 5.2)
+```
+
+We do observe fewer SACs in mouse lemur. All pig and opossum SACs originated from neun-enriched samples, suggesting these low numbers were due to a wide NeuN gate that depleted SACs from the un-enriched samples. Cow SACs are neun+ but in general SACs are neun-, but may be present in neun enriched samples due to a wide gate used in FACS.   
+
+## A2 proportions
+
+```{r}
+objectList$Lizard$lit_type[objectList$Lizard$seurat_clusters == 18] = "A2"
+PlotCelltypeProportions(objectList, proportions, "A2", color = "skyblue", reference.line = 10)
+```
+
+```{r}
+PlotCelltypeProportions(objectList, proportions, "VG3", color = "magenta", reference.line = 1)
+```
+
+```{r}
+sessionInfo()
+knitr::knit_exit()
+```
+
+## Proportion differences between fovea and periphery
+
+Only possible in human because marmoset and macaque have no un-enriched peripheral 
+samples. However, we can't compare between periphery and fovea because there is no 
+reference. The region is confounded by the dissection. Before we were comparing 
+the number of type cells to the total number of cells. We would have to compare as 
+proportion of total cells profiled, but even then different channels will obtain
+different numbers of cells. 
+
+```{r, fig.width=15, fig.height=6, eval = FALSE}
+plotBatches2(subset(humanAC, enrichment == "NONE"), batch = "region", clusters = "type")
+# plotBatches2(subset(macaqueAC, enrichment == "NONE"), batch = "region", clusters = "type")
+# marmosetAC = AssignName(marmosetAC)
+# plotBatches2(subset(marmosetAC, enrichment == "NONE"), batch = "region", clusters = "type")
+
+table(subset(humanAC, enrichment == "NONE")$region, subset(humanAC, enrichment == "NONE")$type)
+# table(subset(macaqueAC, enrichment == "NONE")$region, subset(macaqueAC, enrichment == "NONE")$type)
+# table(subset(marmosetAC, enrichment == "NONE")$region, subset(marmosetAC, enrichment == "NONE")$type)
+```
+
+## Compare proportions
+
+```{r}
+
+```
+

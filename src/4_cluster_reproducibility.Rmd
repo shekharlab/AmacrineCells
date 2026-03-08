@@ -1,0 +1,677 @@
+---
+title: "Single-cell cluster robustness analysis"
+output: 
+  BiocStyle::html_document:
+    toc: true
+date: "2023-07-28"
+params:
+  filepath: "../../Ortho_Objects/vertebrateAC_v2_100.rds"
+  nPermutations: 50
+  nCores: 1
+  method: "seurat"
+  group.by: "species"
+  proportion: 0.8
+  run.perm: TRUE
+---
+
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source("../../utils/dario_functions.R")
+LoadLibraries(load.lisi = FALSE)
+SourceFiles()
+# options(ggplot2.discrete.colour = list(dtColors()), 
+        # ggplot2.discrete.fill = list(dtColors()))
+```
+
+```{r}
+params
+```
+
+# Introduction
+
+Here we will be analyzing the reproducibility of our single cell clusters by varying the key clustering parameters: 
+
+* The cells supplied 
+* The number of PCs used
+* The number of neighbors in the KNN graph 
+* The resolution parameter
+
+Our metrics for determining cluster reproducibility are: 
+
+* Metric 1: the distribution of types across subsamples clusters, measured by Shannon entropy 
+* Metric 2: the tendency of cells from a type to cluster with cells of other types, measured as the fraction of other cells in the cluster
+
+# Example: walk-through one iteration
+
+## Load data
+
+```{r}
+seurat = readRDS(params$filepath)
+
+# DefaultAssay(seurat) = 'integrated'
+# seurat = FindClusters(seurat, resolution = 1.25)
+# DefaultAssay(seurat) = 'RNA'
+```
+
+## Resample data
+
+```{r}
+# Set seed for reproducibility
+set.seed(12345)
+
+system.time({ 
+  sample1 = SubsampleCluster(seurat, 
+                             sample(colnames(seurat), size = floor(length(Cells(seurat))*params$proportion), replace=F), 
+                             nPCs = 15, 
+                             k.param = 18, 
+                             resolution = 1, 
+                             method = params$method, 
+                             group.by = params$group.by)
+})
+```
+
+## Visualize similarity
+
+```{r, fig.width=8, fig.height=6}
+JSHeatmap(JSMatrix(table(sample1$old_seurat_clusters, sample1$seurat_clusters)), stagger.threshold = 0.10, heatmap = FALSE)
+adj.rand.index(sample1$old_seurat_clusters, sample1$seurat_clusters)
+```
+
+## Compute metrics 
+
+Metric 1 (co-clustering): 
+
+1. For the proportion of cells from a type across the k newly computed clusters, $p_1, p_2, ..., p_k$, we compute the Shannon entropy: $H_{T} = -\sum_i p_i log_2 p_i$. 
+2. The minimum is bounded by 0 (least disordered) when all cells of a type are in a single cluster: $H_{T} = - (1 log_2 1 + 0 log_20 + ... + 0 log_20) = 0$. When a type is equally distributed across the k clusters (most disordered), $p_i = \frac{1}{k}$ so the maximum is bounded by: $-k(\frac{1}{k} log_2 \frac{1}{k}) = log_2 k$. Thus, we take $\frac{-\sum_i p_i log_2 p_i}{log_2 k}$ to normalize between 0 and 1. 
+3. In order to have higher scores represent more co-clustering, we take one minus this value: $1+\frac{\sum_i p_i log_2 p_i}{log_2 k}$. 
+
+
+Metric 2 (promiscuity): 
+
+1. For each cell $c_1, c_2, ..., c_n$, from a type, we find the fraction of cells, $f_1, f_2, ..., f_n$, in their cluster that is from cells other than their type. 
+2. We summarize this score as the average fraction: $\frac{1}{n}\sum_i^n f_i$. Since all the cells that are in the same cluster will have the same fraction, we can rewrite the formula as the proportion of other cells in each cluster, scaled by the number of cells $N_i$ from a type in that cluster: $\frac{1}{n}\sum_i^k N_i(1-p_i)$. This value will be zero when there are no cells from that type in cluster i ($N_i=0$), and when all the cells in cluster i are from that type ($1-p_i=0$). Note that this proportion $p_i$ is different from the previous one, since it is a proportion of the cluster rather than a proportion of the type. 
+3. Since higher fractions represent more promiscuity, we subtract this value from 1 so that higher scores represent less promiscuity: $1 - \frac{1}{n}\sum_i^k N_i(1-p_i)$. 
+
+
+Summarize in a data frame
+
+```{r, fig.height=3.5, fig.width=8}
+df.test = data.frame(Type = factor(levels(seurat$seurat_clusters), levels = levels(seurat$seurat_clusters)), 
+                     M1 = ComputeM1(sample1$old_seurat_clusters, sample1$seurat_clusters), 
+                     M2 = ComputeM2(sample1$old_seurat_clusters, sample1$seurat_clusters))
+
+df.test = reshape2::melt(df.test)
+colnames(df.test) = c("Type", "Metric", "Score")
+df.test$Group = "True"
+```
+
+## Shuffled type labels as control
+
+```{r, fig.width=8, fig.height=6}
+# Shuffle type labels to generate control set
+sample1.shuffled = sample1
+sample1.shuffled$old_seurat_clusters = sample(as.integer(sample1$old_seurat_clusters))
+
+df.rand = data.frame(Type = factor(levels(seurat$seurat_clusters), levels = levels(seurat$seurat_clusters)), 
+                     M1 = ComputeM1(sample1.shuffled$old_seurat_clusters, sample1.shuffled$seurat_clusters), 
+                     M2 = ComputeM2(sample1.shuffled$old_seurat_clusters, sample1.shuffled$seurat_clusters))
+
+df.rand = reshape2::melt(df.rand)
+colnames(df.rand) = c("Type", "Metric", "Score")
+df.rand$Group = "Shuffled"
+
+JSHeatmap(JSMatrix(table(sample(sample1.shuffled$old_seurat_clusters), sample1.shuffled$seurat_clusters)), stagger.threshold = 0.10, heatmap = FALSE)
+```
+
+```{r, fig.height=6, fig.width=15}
+df = rbind(df.test, df.rand)
+df$Type = as.character(df$Type)
+
+p1 = ggbarplot(subset(df, Metric == "M1"), x = "Type", y = "Score",
+          fill = "Group", position = position_dodge()) +
+  ylab("Co-clustering score (M1)")+
+  theme(legend.position = "right") + 
+  scale_y_continuous(expand = c(0,0))+
+  RotatedAxis()
+
+p2 = ggbarplot(subset(df, Metric == "M2"), x = "Type", y = "Score",
+          fill = "Group", position = position_dodge()) +
+  ylab("1 - promiscuity score (M2)")+
+  theme(legend.position = "right") + 
+  scale_y_continuous(expand = c(0,0))+
+  RotatedAxis()
+
+ggarrange(p1, p2, nrow = 2, common.legend = T, legend = "right")
+```
+
+# Run analysis 
+
+```{r}
+RunSubsamplingParallel = function(object, nPermutations = 50, fraction.use = 0.8, shuffle.types = FALSE, nCores = 1){
+  
+  # Sample cells
+  subsample.size = floor(length(Cells(object))*fraction.use)
+  rand.cells.use = lapply(seq_len(nPermutations), function(x) sample(colnames(object), size = subsample.size, replace=F))
+  
+  # Sample parameters
+  rand.nPCs = sample(c(15:30), nPermutations, replace = TRUE)
+  rand.k = sample(c(16:24), nPermutations, replace = TRUE)
+  rand.res = sample(seq(1, 2, by = 0.1), nPermutations, replace = TRUE)
+
+  # Make cluster
+  cl <- parallel::makeCluster(
+    nCores, 
+    type = "PSOCK"
+    )
+  
+  # register it to be used by %dopar%
+  doParallel::registerDoParallel(cl = my.cluster)
+  
+  # Export functions and objects
+  clusterExport(cl=cl, list("SubsampleCluster", "rand.cells.use", "rand.nPCs", "rand.k",
+                          "rand.res", "shuffle.types", "params"),
+              envir=environment())
+
+  # Parallel loop
+  clusters = foreach(iteration = seq_len(nPermutations)) %dopar% {
+    message("Running iteration #", iteration, " with the following params: \n nPCs: ", rand.nPCs[[iteration]], "\n k.param: ", rand.k[[iteration]], "\n res: ", rand.res[[iteration]])
+    
+    sample = suppressMessages(SubsampleCluster(object, 
+                                               cells.use = rand.cells.use[[iteration]],
+                                               nPCs = rand.nPCs[[iteration]], 
+                                               k.param = rand.k[[iteration]], 
+                                               resolution = rand.res[[iteration]], 
+                                               shuffle.types = shuffle.types, 
+                                               method = params$method))
+    
+    return(list(original = sample$old_seurat_clusters, permuted = sample$seurat_clusters))
+  }
+  
+  stopCluster(cl)
+  
+  # Name by permutation
+  names(clusters) = seq_len(nPermutations)
+  
+  return(list(clusters = clusters, 
+              rand.cells.use = rand.cells.use, 
+              rand.nPCs = rand.nPCs, 
+              rand.k = rand.k, 
+              rand.res = rand.res))
+}
+```
+
+## Run permutations
+
+```{r, eval = params$run.perm}
+system.time({ 
+  perm.data = RunSubsampling(seurat, 
+                             nPermutations = params$nPermutations, 
+                             fraction.use = params$proportion,
+                             nCores = 1, 
+                             method = params$method, 
+                             group.by = params$group.by)
+})
+
+saveRDS(perm.data, paste0("permuted_clusters/", gsub(".rds", "", basename(params$filepath)), "_permdata.rds"))
+
+# message("--- Now in parallel with future --- ")
+# 
+# library(future)
+# plan("multiprocess", workers = 30)
+# 
+# system.time({ 
+#   perm.data = RunSubsampling(seurat, 
+#                              nPermutations = params$nPermutations, 
+#                              fraction.use = params$proportion,
+#                              nCores = 1)
+# })
+```
+
+Parallelization makes it go slower!
+
+## Calculate scores
+
+```{r}
+perm.data = readRDS(paste0("permuted_clusters/", gsub(".rds", "", basename(params$filepath)), "_permdata.rds"))
+
+scores = lapply(perm.data$clusters, function(clusters){
+  
+    # Object "seurat" has original clusters
+    m1.scores = ComputeM1(clusters$original, clusters$permuted)
+    m2.scores = ComputeM2(clusters$original, clusters$permuted)
+    
+    # Shuffle type labels to generate control set
+    random_seurat_clusters = sample(clusters$original)
+    m1.random = ComputeM1(random_seurat_clusters, clusters$permuted)
+    m2.random = ComputeM2(random_seurat_clusters, clusters$permuted)
+    
+    return(list(m1.scores = m1.scores, 
+                m2.scores = m2.scores, 
+                m1.random = m1.random, 
+                m2.random = m2.random))
+})
+```
+
+## Plot results
+
+```{r, fig.height=6, fig.width=15}
+# M1 scores
+m1.scores = do.call(rbind, lapply(scores, function(x) x$m1.scores))
+colnames(m1.scores) = levels(seurat$seurat_clusters)
+
+df.m1test = reshape2::melt(m1.scores)
+colnames(df.m1test) = c("Iteration", "Type", "Score")
+df.m1test$Group = "True"
+
+m1.random = do.call(rbind, lapply(scores, function(x) x$m1.random))
+colnames(m1.random) = levels(seurat$seurat_clusters)
+
+df.m1rand = reshape2::melt(m1.random)
+colnames(df.m1rand) = c("Iteration", "Type", "Score")
+df.m1rand$Group = "Shuffled"
+
+df.m1 = rbind(df.m1test, df.m1rand)
+df.m1$Metric = "M1"
+df.m1$Type = as.character(df.m1$Type)
+
+# M2 scores
+m2.scores = do.call(rbind, lapply(scores, function(x) x$m2.scores))
+colnames(m2.scores) = levels(seurat$seurat_clusters)
+
+df.m2test = reshape2::melt(m2.scores)
+colnames(df.m2test) = c("Iteration", "Type", "Score")
+df.m2test$Group = "True"
+
+m2.random = do.call(rbind, lapply(scores, function(x) x$m2.random))
+colnames(m2.random) = levels(seurat$seurat_clusters)
+
+df.m2rand = reshape2::melt(m2.random)
+colnames(df.m2rand) = c("Iteration", "Type", "Score")
+df.m2rand$Group = "Shuffled"
+
+df.m2 = rbind(df.m2test, df.m2rand)
+df.m2$Metric = "M2"
+df.m2$Type = as.character(df.m2$Type)
+
+p1 = ggbarplot(df.m1, x = "Type", y = "Score",
+          fill = "Group", position = position_dodge(), add = c("mean_se")) +
+  ylab("Co-clustering score (M1)")+
+  theme(legend.position = "right") + 
+  scale_y_continuous(expand = c(0,0))+
+  RotatedAxis()
+
+p2 = ggbarplot(df.m2, x = "Type", y = "Score",
+          fill = "Group", position = position_dodge(), add = c("mean_se")) +
+  ylab("1 - promiscuity score (M2)")+
+  theme(legend.position = "right") + 
+  scale_y_continuous(expand = c(0,0))+
+  RotatedAxis()
+
+ggarrange(p1, p2, nrow = 2, common.legend = T, legend = "right")
+```
+
+M2 scores have a tendency of being smaller for smaller clusters because small clusters might not be resolved when fewer cells are sampled or when the resolution parameter is lower. 
+
+# Adjusted rand indices across permutations
+
+```{r}
+ari.df = data.frame(Permutation = names(perm.data$clusters), 
+                      ARI = sapply(perm.data$clusters, function(x) adj.rand.index(x$original, x$permuted)))
+
+ggbarplot(ari.df, x = "Permutation", y = "ARI", position = position_dodge(), fill = "grey") +
+  ylab("Adjusted rand index (ARI)")+
+  scale_y_continuous(expand = c(0,0), limits = c(0,0.91))+
+  RotatedAxis()
+```
+
+# Average jaccard of each type
+
+```{r}
+
+```
+
+# Permutation plot
+
+Adapted from Langfelder and Horvath 2012
+
+```{r}
+library(WGCNA)
+
+nCells = ncol(seurat)
+nRuns = params$nPermutations
+labels = matrix(0, nRuns + 1, nCells)
+
+ref_clusters = as.numeric(as.character(seurat$seurat_clusters))
+ref_barcodes = names(seurat$seurat_clusters)
+
+labels[1,] = ref_clusters
+
+# Match labels from each resampling to the labels obtained for the full data set
+# This may also take some time. Hence, the results are saved and next time the user can skip this part and
+# load the data from disk. 
+
+for(r in 2:(nRuns+1)){
+  this_barcodes = names(perm.data$clusters[[r-1]]$original)
+  converted = matchLabels(as.numeric(as.character(perm.data$clusters[[r-1]]$permuted))+1,
+                          as.numeric(as.character(perm.data$clusters[[r-1]]$original))+1)-1
+  labels[r,] = converted[match(ref_barcodes, this_barcodes),]
+}
+
+rownames(labels) = c("Ref", paste0("Perm", 1:nRuns))
+
+# Sort by dendro.order
+if(startsWith(basename(params$filepath), "vertebrateAC")){
+  dendro = CorrelationHeatmap(seurat, group.by = 'seurat_clusters', return.dendrogram = TRUE)
+  seurat$dendro.order = factor(seurat$seurat_clusters, levels = labels(dendro))
+  dendro.order = levels(seurat$dendro.order)
+  sorted.matrix = labels[,order(factor(labels[1,], levels = dendro.order))]
+} else {
+  seurat = ClusterDendrogram(seurat, assay = "RNA")
+  dendro.order = labels(phylogram::as.dendrogram(seurat@tools$BuildClusterTree))
+  sorted.matrix = labels[,order(factor(labels[1,], levels = dendro.order))]
+}
+
+# Relabel un-mapped cell modules to -1 (grey) but keep NAs as NAs (white)
+sorted.matrix[!sorted.matrix %in% unique(ref_clusters) & !is.na(sorted.matrix)] = -1
+
+# Account for zero based indexing
+zeroIndex = any(seurat$seurat_clusters == 0)
+if(zeroIndex) {
+  colors = structure(labels2colors_dt(0:(max(ref_clusters)+1), omit = "white"), names = as.character(-1:max(ref_clusters)))
+} else {
+  colors = structure(labels2colors_dt(0:(max(ref_clusters)), omit = "white"), names = as.character(c(-1, 1:max(ref_clusters))))
+}
+```
+
+```{r, fig.height=15, fig.width=20}
+# pdf('../../figures/my_figs/orthotype-reproducibility.pdf', height=8, width=20)
+
+# Row and column splits
+row_km = seq_along(rownames(sorted.matrix)) %>% setNames(rownames(sorted.matrix))
+col_km = factor(sorted.matrix[1,], levels = dendro.order)
+
+# Label clusters
+midpoints = sapply(dendro.order, function(cluster) floor(mean(which(sorted.matrix[1,] == cluster))))
+top_ha = columnAnnotation(foo = anno_mark(at = midpoints, 
+                                      labels = as.numeric(dendro.order), 
+                                      labels_rot = 0, 
+                                      link_height = unit(7,"mm"), 
+                                      # link_width = unit(3,"mm"), 
+                                      link_gp = gpar(col="black", lty = 1, lwd = 1)))
+
+# Parameter annotation
+# right_ha = rowAnnotation(nPCs = anno_numeric(c(20, perm.data$rand.nPCs), bg_gp = gpar(fill = myPalette(5)[1], col = "white")), 
+#                          k = anno_numeric(c(20, perm.data$rand.k), bg_gp = gpar(fill = myPalette(5)[2], col = "white")), 
+#                          Res = anno_numeric(c(1.5, perm.data$rand.res), bg_gp = gpar(fill = myPalette(5)[3], col = "white")), 
+#                          nClusters = anno_numeric(c(nClusters(seurat), sapply(perm.data$clusters, function(x) length(levels(x$permuted)))), bg_gp = gpar(fill = myPalette(5)[4], col = "white")),
+#                          ARI = anno_numeric(c(1, round(ari.df$ARI, 2)), bg_gp = gpar(fill = myPalette(5)[5], col = "white")),
+#                          annotation_name_rot = 45, 
+#                          width = unit(5, "cm"))
+
+right_ha = rowAnnotation(nPCs = anno_barplot(c(20, perm.data$rand.nPCs), border = FALSE, gp = gpar(fill = myPalette(5)[1], col = "white")), 
+                         k = anno_barplot(c(20, perm.data$rand.k), border = FALSE, gp = gpar(fill = myPalette(5)[2], col = "white")),
+                         Res = anno_barplot(c(1.5, perm.data$rand.res), border = FALSE, gp = gpar(fill = myPalette(5)[3], col = "white")),
+                         nClusters = anno_barplot(c(nClusters(seurat), sapply(perm.data$clusters, function(x) length(levels(x$permuted)))), border = FALSE, gp = gpar(fill = myPalette(5)[4], col = "white")),
+                         ARI = anno_barplot(c(1, round(ari.df$ARI, 2)), border = FALSE, gp = gpar(fill = myPalette(5)[5], col = "white")),
+                         annotation_name_rot = 45, 
+                         width = unit(5, "cm"), 
+                         gap = unit(2, "mm"))
+
+# custom_colors = c('grey', colorspace::lighten(myPalette(floor(length(colors)/2)), 0.1), colorspace::lighten(myPalette(floor(length(colors)/2)), 0.3)) %>% setNames(seq(-1, length(colors)-2))
+
+# Heatmap
+Heatmap(sorted.matrix, name = "mat2", show_row_names = FALSE, 
+        show_column_names = FALSE, na_col = "white", col = colors, 
+        cluster_rows = FALSE, cluster_columns = FALSE, row_split = row_km, 
+        # column_split = col_km, column_gap = unit(0,"mm"), 
+        row_gap = unit(0, "mm"), column_title = NULL, border = FALSE, 
+        show_heatmap_legend = FALSE, 
+        row_title = names(row_km), row_title_rot = 0, 
+        top_annotation = top_ha, right_annotation = right_ha, 
+        use_raster = FALSE, 
+        raster_quality = 2)
+
+# Add horizontal bars separating rows
+for(i_slice in seq_along(unique(row_km))) {
+  	decorate_heatmap_body("mat2", row_slice = i_slice, {
+  	  grid.lines(c(0, 1), c(0, 0), gp = gpar(lty = 1, lwd = 1))
+  	})
+}
+
+decorate_heatmap_body("mat2", row_slice = 1, {
+  grid.lines(c(1,0), c(1, 1), gp = gpar(lty = 1, lwd = 1))
+})
+
+# dev.off()
+```
+
+# Analysis of parameters predictive of ARI
+
+```{r}
+parameters.df = data.frame(ARI = ari.df$ARI, 
+                          nPCs = perm.data$rand.nPCs, 
+                          k.param = perm.data$rand.k, 
+                          resolution = perm.data$rand.res,
+                          nClusters = sapply(perm.data$clusters, function(x) length(levels(x$permuted))))
+
+head(parameters.df)
+```
+
+
+```{r}
+# Run lm
+model = lm(ARI ~ nPCs + k.param + resolution, data = parameters.df)
+summary(model)
+```
+
+```{r, fig.height=6, fig.width=6}
+library(psych)
+pairs.panels(parameters.df, 
+             method = "pearson", # correlation method
+             hist.col = "#00AFBB",
+             density = TRUE,  # show density plots
+             ellipses = TRUE # show correlation ellipses
+             )
+```
+
+```{r}
+knitr::knit_exit()
+```
+
+# Figure for paper
+
+```{r, fig.height=9, fig.width=20}
+pdf('../../figures/my_figs/orthotype-reproducibility.pdf', height=9, width=20)
+
+# Row and column splits
+row_km = seq_along(rownames(sorted.matrix)) %>% setNames(rownames(sorted.matrix))
+col_km = factor(sorted.matrix[1,], levels = dendro.order)
+
+# Label clusters
+midpoints = sapply(dendro.order, function(cluster) floor(mean(which(sorted.matrix[1,] == cluster))))
+top_ha = columnAnnotation(foo = anno_mark(at = midpoints, 
+                                      labels = as.numeric(dendro.order), 
+                                      labels_rot = 0, 
+                                      link_height = unit(7,"mm"), 
+                                      # link_width = unit(3,"mm"), 
+                                      link_gp = gpar(col="black", lty = 1, lwd = 1)))
+
+right_ha = rowAnnotation(nPCs = anno_barplot(c(20, perm.data$rand.nPCs), border = FALSE, gp = gpar(fill = myPalette(5)[1], col = "white")), 
+                         k = anno_barplot(c(20, perm.data$rand.k), border = FALSE, gp = gpar(fill = myPalette(5)[2], col = "white")),
+                         Res = anno_barplot(c(1.5, perm.data$rand.res), border = FALSE, gp = gpar(fill = myPalette(5)[3], col = "white")),
+                         nClusters = anno_barplot(c(nClusters(seurat), sapply(perm.data$clusters, function(x) length(levels(x$permuted)))), border = FALSE, gp = gpar(fill = myPalette(5)[4], col = "white")),
+                         ARI = anno_barplot(c(1, round(ari.df$ARI, 2)), border = FALSE, gp = gpar(fill = myPalette(5)[5], col = "white")),
+                         annotation_name_rot = 45, 
+                         width = unit(5, "cm"), 
+                         gap = unit(2, "mm"))
+
+custom_colors = c('grey', colorspace::lighten(myPalette(floor(length(colors)/2)), 0.1), colorspace::lighten(myPalette(floor(length(colors)/2)), 0.3)) %>% setNames(seq(-1, length(colors)-2))
+
+# Heatmap
+Heatmap(sorted.matrix, name = "mat2", show_row_names = FALSE, 
+        show_column_names = FALSE, na_col = "white", col = custom_colors, 
+        cluster_rows = FALSE, cluster_columns = FALSE, row_split = row_km, 
+        # column_split = col_km, column_gap = unit(0,"mm"), 
+        row_gap = unit(0, "mm"), column_title = NULL, border = FALSE, 
+        show_heatmap_legend = FALSE, 
+        row_title = names(row_km), row_title_rot = 0, 
+        top_annotation = top_ha, right_annotation = right_ha, 
+        use_raster = TRUE, 
+        raster_quality = 2)
+
+# Add horizontal bars separating rows
+for(i_slice in seq_along(unique(row_km))) {
+  	decorate_heatmap_body("mat2", row_slice = i_slice, {
+  	  grid.lines(c(0, 1), c(0, 0), gp = gpar(lty = 1, lwd = 1))
+  	})
+}
+
+decorate_heatmap_body("mat2", row_slice = 1, {
+  grid.lines(c(1,0), c(1, 1), gp = gpar(lty = 1, lwd = 1))
+})
+
+dev.off()
+```
+
+# Leave one out cross validation
+
+```{r}
+vertebrateAC = readRDS('../../../storage/Ortho_Objects/vertebrateAC_v3_100.rds')
+
+dendro = CorrelationHeatmap(vertebrateAC, 
+                   group.by = 'seurat_clusters', 
+                   cols = c('white', "#922144FF"), 
+                   # annotate.by = 'classification', 
+                   # annotation_cols = c('GABA' = "#DBAD5DFF", 'Gly' = "#4F4782FF"), 
+                   row_names_gp = gpar(fontsize = 6), 
+                   show_column_names = FALSE, 
+                   return.dendrogram = TRUE)
+vertebrateAC$dendro.order = factor(vertebrateAC$seurat_clusters, levels = labels(dendro))
+
+speciesList = setdiff(names(SPECIESFILES), c("Zebrafish", "Goldfish", "Lamprey"))
+loo.clustering = lapply(speciesList, function(species) {
+  object = readRDS(paste0('../../../storage/Ortho_Objects/cross_validation/', species, '.rds'))
+  return(data.frame(cell = Cells(object), seurat_clusters = object$seurat_clusters) %>% setNames(c('cell', species)))
+})
+saveRDS(loo.clustering, 'loo.clustering.rds')
+
+loo.clustering = readRDS('loo.clustering.rds')
+loo.merged = Reduce(function(dtf1, dtf2) merge(dtf1, dtf2, by = "cell", all=T), loo.clustering)
+loo.merged$type = vertebrateAC$type[match(loo.merged$cell, Cells(vertebrateAC))]
+loo.merged$seurat_clusters = vertebrateAC$seurat_clusters[match(loo.merged$cell, Cells(vertebrateAC))]
+loo.merged$species = vertebrateAC$species[match(loo.merged$cell, Cells(vertebrateAC))]
+
+# Order by species
+loo.merged = loo.merged %>% arrange(species)
+
+lapply(speciesList, function(species) ConfusionMatrix2(loo.merged$type, loo.merged[[species]]))
+lapply(speciesList, function(species) length(unique(loo.merged[[species]])))
+```
+
+Adapted from Langfelder and Horvath 2012
+
+```{r}
+library(WGCNA)
+
+nCells = ncol(vertebrateAC)
+nRuns = length(speciesList)
+labels = matrix(0, nRuns + 1, nCells)
+
+ref_clusters = as.numeric(as.character(loo.merged$seurat_clusters))
+ref_barcodes = loo.merged$cell
+labels[1,] = ref_clusters
+
+for(r in 2:(nRuns+1)){
+  this_barcodes = loo.merged$cell
+  converted = matchLabels(as.numeric(as.character(loo.merged[,r]))+1,
+                          as.numeric(as.character(loo.merged$seurat_clusters))+1)-1
+  labels[r,] = converted[match(ref_barcodes, this_barcodes),]
+}
+
+rownames(labels) = c("17 species", paste0('- ', speciesList))
+
+# Sort by dendro.order
+dendro.order = levels(vertebrateAC$dendro.order)
+sorted.matrix = labels[,order(factor(labels[1,], levels = dendro.order))]
+
+# Relabel un-mapped cell modules to -1 (grey) but keep NAs as NAs (white)
+sorted.matrix[!sorted.matrix %in% unique(ref_clusters) & !is.na(sorted.matrix)] = -1
+
+# Make dendrogram
+# hclust(AvgExpr(seurat, group.by = "seurat_clusters", features = VariableFeatures(seurat), assay = "RNA"))
+
+# Account for zero based indexing
+zeroIndex = any(vertebrateAC$seurat_clusters == 0)
+if(zeroIndex) {
+  colors = structure(labels2colors_dt(0:(max(ref_clusters)+1), omit = "white"), names = as.character(-1:max(ref_clusters)))
+} else {
+  colors = structure(labels2colors_dt(0:(max(ref_clusters)), omit = "white"), names = as.character(c(-1, 1:max(ref_clusters))))
+}
+```
+
+```{r, fig.height=5, fig.width=17, dpi = 600}
+
+pdf('../../figures/my_figs/cross-validation.pdf', height=5, width=17)
+# Row and column splits
+row_km = seq_along(rownames(sorted.matrix)) %>% setNames(rownames(sorted.matrix))
+col_km = factor(sorted.matrix[1,], levels = dendro.order)
+
+# Label clusters
+midpoints = sapply(dendro.order, function(cluster) floor(mean(which(sorted.matrix[1,] == cluster))))
+top_ha = columnAnnotation(foo = anno_mark(at = midpoints, 
+                                      labels = dendro.order, 
+                                      labels_rot = 0, 
+                                      link_height = unit(7,"mm"), 
+                                      # link_width = unit(3,"mm"), 
+                                      link_gp = gpar(col="black", lty = 1, lwd = 1)))
+
+# Parameter annotation
+# right_ha = rowAnnotation(#nPCs = anno_numeric(c(20, perm.data$rand.nPCs), bg_gp = gpar(fill = "red", col = "white")),
+#                          #k = anno_numeric(c(20, perm.data$rand.k), bg_gp = gpar(fill = "yellow", col = "white")),
+#                          #Res = anno_numeric(c(1.5, perm.data$rand.res), bg_gp = gpar(fill = "green", col = "white")),
+#                          nClusters = anno_numeric(c(nClusters(seurat), sapply(perm.data$clusters, function(x) length(levels(x$permuted)))), bg_gp = gpar(fill = "blue", col = "white")),
+#                          ARI = anno_numeric(c(0, round(ari.df$ARI, 2)), bg_gp = gpar(fill = "purple", col = "white")),
+#                          annotation_name_rot = 45,
+#                          width = unit(5, "cm"))
+right_ha = NULL
+
+custom_colors = c(colorspace::lighten(myPalette(length(colors)/2), 0.1), colorspace::lighten(myPalette(length(colors)/2), 0.3)) %>% setNames(seq(-1, length(colors)-2))
+# custom_colors = colorspace::lighten(myPalette(length(colors)), 0.5) %>% setNames(seq(-1, length(colors)-2))
+
+# Heatmap
+Heatmap(sorted.matrix, name = "mat2", show_row_names = FALSE, 
+        show_column_names = FALSE, 
+        na_col = "black", 
+        col = custom_colors, 
+        cluster_rows = FALSE, 
+        cluster_columns = FALSE, 
+        row_split = row_km, 
+        # column_split = col_km, column_gap = unit(0,"mm"), 
+        row_gap = unit(0, "mm"), 
+        column_title = NULL, 
+        border = FALSE, 
+        show_heatmap_legend = FALSE, 
+        row_title = names(row_km), 
+        row_title_rot = 0, 
+        top_annotation = top_ha, 
+        right_annotation = right_ha, 
+        use_raster = TRUE, 
+        raster_quality = 2)
+
+# Add horizontal bars separating rows
+for(i_slice in seq_along(unique(row_km))) {
+  	decorate_heatmap_body("mat2", row_slice = i_slice, {
+  	  grid.lines(c(0, 1), c(0, 0), gp = gpar(lty = 1, lwd = 1))
+  	})
+}
+
+decorate_heatmap_body("mat2", row_slice = 1, {
+  grid.lines(c(1,0), c(1, 1), gp = gpar(lty = 1, lwd = 1))
+})
+
+dev.off()
+```
+
+```{r}
+sessionInfo()
+```
