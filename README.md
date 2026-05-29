@@ -12,17 +12,18 @@ This repository contains analyses for our paper, **"The extreme diversity of ret
 
 The paper can be accessed here: 
 
-[insert biorxiv link]
+[https://www.biorxiv.org/content/10.64898/2026.03.07.710289v1](bioRxiv link]
 
 ## Repository Structure
-- **src/0_run.R**: file to run analyses
-- **src/1_species_clustering.Rmd**: Clusters of amacrine cells within each species. Run once per species. 
+- **src/0_run.R**: file to run analyses. 
+- **src/1_species_clustering.Rmd**: Clusters of amacrine cells within each species. Run once per species (see 0_run.R). 
 - **src/2_orthotype_analysis.Rmd**: Orthotype integration and major analysis. 
 - **src/3_literature_proportions.Rmd** Comparison of proportions from the IHC literature and sc/snRNA-seq.  
 - **src/4_cluster_reproducibility.Rmd** Pipeline for analyzing the reproducibility of clustering. 
 - **src/5_tf_analysis.Rmd** Analysis of transcription factors using parsimony trees. 
-- **src/6_samap_analysis.ipynb** Runs SAMap integration. 
-- **src/7_figures.Rmd** Makes the figures from the paper. 
+- **src/6_samap_analysis.ipynb** Runs SAMap integration.
+- **src/7_sac_analysis.Rmd** Runs the analysis of ON and OFF starburst amacrine cells. 
+- **src/8_figures.Rmd** Makes the figures from the paper. 
 - **src/utils**: Utility functions used in the notebooks. 
 
 ## Getting Started
