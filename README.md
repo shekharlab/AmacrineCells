@@ -12,7 +12,7 @@ This repository contains analyses for our paper, **"The extreme diversity of ret
 
 The paper can be accessed here: 
 
-[https://www.biorxiv.org/content/10.64898/2026.03.07.710289v1](bioRxiv link)
+[bioRxiv link](https://www.biorxiv.org/content/10.64898/2026.03.07.710289v1)
 
 ## Repository Structure
 - **src/0_run.R**: file to run analyses. 
