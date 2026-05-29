@@ -3800,6 +3800,182 @@ FeaturePlot(kfish.ac, features = 'pdgfra', order = TRUE)
 # li_ARHGAP21;ze_arhgap23b
 ```
 
+### Figure S11
+
+```{r, fig.height=4, fig.width=15}
+ac.umap = readRDS('../../Ortho_Objects/ac.umap.final.rds') 
+ac.umap$orthotypes_li = ac.ortho$type[paste0(ac.umap$species_full, '_', apply(str_split_fixed(ac.umap$V1, '-', 3)[,1:2], 1, paste, collapse = '-'))]
+ac.umap$orthotypes_ch = ac.ortho$type[paste0(ac.umap$species_full, '_', ExtractString(ac.umap$V1, after = '-'))]
+ac.umap$orthotypes = ifelse(is.na(ac.umap$orthotypes_li), as.character(ac.umap$orthotypes_ch), as.character(ac.umap$orthotypes_li))
+ac.umap$orthotypes = orthotype_labels(ac.umap$orthotypes, as.factor = FALSE)
+
+# Tabulation and counting
+js.mat = JSMatrix(table(factor(ac.umap$orthotypes, ORTHOTYPES), ac.umap$leiden_clusters))
+
+p1 = JSHeatmap2(factor(ac.umap$orthotypes, ORTHOTYPES),
+             ac.umap$leiden_clusters,
+             stagger.threshold = 0.1,
+             row.order = ORTHOTYPES,
+             border.col = NA,
+             title = paste0('Bridge: chicken and lizard', '\n ARI: ', 
+                            round(adj.rand.index(factor(ac.umap$orthotypes, ORTHOTYPES), ac.umap$leiden_clusters), 2))) +
+            # coord_flip()+
+    ArialFont()+
+  theme(axis.text.y = element_text(size = 6, color = 'black', 
+                                   # margin = margin(b = -200)
+                                   # margin = unit(c(0,0,0,0), 'cm')
+                                   ),
+        axis.ticks.length.y = unit(1, "pt"),
+        axis.ticks = element_blank(),
+        axis.text.x = element_blank(), #element_text(size = 5, color = 'black'),
+        plot.background = element_rect(fill = "transparent", colour = NA)) +
+    scale_y_discrete(position = "right") + NoLegend()
+
+# res.chli = process_ortho_heatmap('samap/pm_sh_ca_kf_ze_ne_am_ch_li-ac-v1-umap.csv', 
+#                                  stagger.threshold = 0.1, 
+#                                  cluster_col = "leiden_clusters_4.5")
+res.ch = process_ortho_heatmap('samap/pm_sh_ca_kf_ze_ne_am_ch-ac-v1-umap.csv', 
+                               stagger.threshold = 0.1, 
+                               cluster_col = "leiden_clusters_5", 
+                               title_label = 'Bridge: chicken')
+res.chop = process_ortho_heatmap('samap/pm_sh_ca_kf_ze_ne_am_ch_op-ac-v1-umap.csv', 
+                                 stagger.threshold = 0.1, 
+                                 cluster_col = "leiden_clusters_4", 
+                                 title_label = 'Bridge: chicken and opossum')
+res.chliop = process_ortho_heatmap('samap/pm_sh_ca_kf_ze_ne_am_ch_li_op-ac-v1-umap.csv', 
+                                   stagger.threshold = 0.15, 
+                                   cluster_col = "leiden_clusters_4.5", 
+                                   title_label = 'Bridge: chicken, lizard, opossum')
+res.mfms = process_ortho_heatmap('samap/pm_sh_kf_ze_am_ch_li_op_mm_mf-ac-v1-umap.csv', 
+                                 stagger.threshold = 0.15, 
+                                 cluster_col = "leiden_clusters_4", 
+                                 title_label = 'Bridge: chicken, lizard, \nopossum, mouse, macaque')
+
+
+p1 | res.ch$plot | res.chop$plot | res.chliop$plot | res.mfms$plot
+ggsave('../../figures/my_figs/samap-robustness.pdf')
+
+# res.ch$plot | p2
+```
+
+```{r}
+ac.umap.chliop = as.data.frame(fread('samap/pm_sh_ca_kf_ze_ne_am_ch-ac-v1-umap.csv')) # chicken and opossum
+ac.umap.chliop$leiden_clusters = ac.umap.chliop$leiden_clusters_5
+ac.umap.chliop$species_full = convert_values(ac.umap.chliop$species, index$species %>% setNames(index$ident))
+ac.umap.chliop$species_full = factor(factor(ac.umap.chliop$species_full, levels = index$species))
+ac.umap.chliop$orthotypes_li = ac.ortho$type[paste0(ac.umap.chliop$species_full, '_', apply(str_split_fixed(ac.umap.chliop$V1, '-', 3)[,1:2], 1, paste, collapse = '-'))]
+ac.umap.chliop$orthotypes_ch = ac.ortho$type[paste0(ac.umap.chliop$species_full, '_', ExtractString(ac.umap.chliop$V1, after = '-'))]
+ac.umap.chliop$orthotypes = ifelse(is.na(ac.umap.chliop$orthotypes_li), as.character(ac.umap.chliop$orthotypes_ch), as.character(ac.umap.chliop$orthotypes_li))
+ac.umap.chliop$orthotypes = orthotype_labels(ac.umap.chliop$orthotypes, as.factor = FALSE)
+
+# Tabulation and counting
+js.mat.chliop = JSMatrix(table(factor(ac.umap.chliop$orthotypes, ORTHOTYPES), ac.umap.chliop$leiden_clusters))
+# over.stats = OverlapStatistics(table(factor(ac.umap.noliz$orthotypes, ORTHOTYPES), ac.umap.noliz$leiden_clusters))
+
+ggarrange(
+  JSHeatmap2(factor(ac.umap.chliop$orthotypes, ORTHOTYPES),
+             ac.umap.chliop$leiden_clusters,
+             stagger.threshold = 0.15,
+             row.order = ORTHOTYPES,
+             border.col = NA,
+             title = 'Bridge: chicken, lizard, and opossum') +
+            # coord_flip()+
+    ArialFont()+
+  theme(axis.text.y = element_text(size = 6, color = 'black', 
+                                   # margin = margin(b = -200)
+                                   # margin = unit(c(0,0,0,0), 'cm')
+                                   ),
+        axis.ticks.length.y = unit(1, "pt"),
+        axis.ticks = element_blank(),
+        axis.text.x = element_blank(), #element_text(size = 5, color = 'black'),
+        plot.background = element_rect(fill = "transparent", colour = NA)) +
+    scale_y_discrete(position = "right"),
+  common.legend = TRUE,
+  legend = 'none')
+```
+
+
+```{r, fig.height= 4, fig.width=16}
+nrow(BidirectionalBestHits(js.mat, verbose = F))
+nrow(BidirectionalBestHits(res.ch$matrix, verbose = F))
+nrow(BidirectionalBestHits(res.chop$matrix, verbose = F))
+nrow(BidirectionalBestHits(res.chliop$matrix, verbose = F))
+nrow(BidirectionalBestHits(res.mfms$matrix, verbose = F))
+
+best.jac.df = data.frame(orthotype = get_numbers(rownames(js.mat)), 
+                         best.chli = apply(js.mat, 1, max), 
+                         best.ch = apply(res.ch$matrix, 1, max), 
+                         best.chop = apply(res.chop$matrix, 1, max), 
+                         best.chliop = apply(res.chliop$matrix, 1, max), 
+                         best.chliopmmmf = apply(res.mfms$matrix, 1, max)
+                         )
+
+ScatterPlot(best.jac.df, x = 'best.ch', y = 'best.chli', y_equals_x = T, labels = 'orthotype', max.overlaps = 10, 
+            ylab = 'Best jaccard score\n(chicken and lizard)', xlab = 'Best jaccard score\n(chicken)', r = T) |
+  ScatterPlot(best.jac.df, x = 'best.chop', y = 'best.chli', y_equals_x = T, labels = 'orthotype', max.overlaps = 10, 
+            ylab = 'Best jaccard score\n(chicken and lizard)', xlab = 'Best jaccard score\n(chicken and opossum)', r = T) | 
+  ScatterPlot(best.jac.df, x = 'best.chliop', y = 'best.chli', y_equals_x = T, labels = 'orthotype', max.overlaps = 10, 
+            ylab = 'Best jaccard score\n(chicken and lizard)', xlab = 'Best jaccard score\n(chicken, lizard, and opossum)', r = T) |
+  ScatterPlot(best.jac.df, x = 'best.chliopmmmf', y = 'best.chli', y_equals_x = T, labels = 'orthotype', max.overlaps = 10, 
+            ylab = 'Best jaccard score\n(chicken and lizard)', xlab = 'Best jaccard score \n(chicken, lizard, opossum, mouse, macaque)', r = T)
+
+ggsave('../../figures/my_figs/conservation-robustness.pdf')
+```
+
+
+```{r, fig.height=8, fig.width=14}
+res.mfms$data$leiden_clusters = as.character(res.mfms$data$leiden_clusters)
+
+(TitlePlot((PrettyUmap(ac.ortho, group.by = 'species', alpha = 0.6, pt.size = 0.1, label = F, show.legend = T) +
+             guides(color = guide_legend(byrow = TRUE)) + theme(legend.key.height = unit(12, "pt"))), 'Seurat CCA (17 amniotes)') |
+  TitlePlot(PrettyUmap(ac.ortho, group.by = 'classification', alpha = 0.6, pt.size = 0.1), 'Subclass') |
+      TitlePlot(PrettyUmap(ac.ortho, group.by = 'orthotype.no', alpha = 0.6, pt.size = 0.1), 'Mean silhouette: 0.6')) / 
+  (TitlePlot((PrettyUmap(res.mfms$data, group.by = 'species_full', alpha = 0.6, pt.size = 0.1, label = F, show.legend = T) +
+            guides(color = guide_legend(byrow = TRUE)) + theme(legend.key.height = unit(12, "pt"))), 'SAMap (10 vertebrates)') |
+          TitlePlot(PrettyUmap(res.mfms$data, group.by = 'cell_class2', alpha = 0.6, pt.size = 0.1), 'Subclass') |
+          TitlePlot(PrettyUmap(res.mfms$data, group.by = 'leiden_clusters', alpha = 0.6, pt.size = 0.1), 'Mean silhouette: 0.2')) 
+
+ggsave('../../figures/my_figs/samap-lower-res.pdf')
+```
+
+```{r, fig.height=6, fig.width=7}
+JSHeatmap2(res.mfms$data$orthotypes, res.mfms$data$leiden_clusters, row.order = ORTHOTYPES, 
+           xlab = 'SAMap vertebrate leiden clusters', ylab = 'Seurat amniote orthotypes', ari = T)
+```
+
+
+```{r, fig.height=5, fig.width=10}
+seurat = readRDS('../../Ortho_Objects/vertebrateAC_seurat.rds')
+seurat = MapBack(seurat, ac.ortho, group.by = 'orthotype.no')
+seurat.ds = DownsampleSeurat(seurat[,!is.na(seurat$orthotype.no)], group.by = 'orthotype.no', size = 1000)
+# seurat.ds = seurat[,!is.na(seurat$orthotype.no)]
+
+# dist = 1-seurat@graphs$integrated_snn[Cells(seurat.ds), Cells(seurat.ds)]
+
+# Computing silhouette in UMAP space because neither PCA nor graph space are comparable between Seurat and SAMap
+silhouttes = FindSilhouette(seurat.ds, 
+                            group.by = 'orthotype.no', 
+                            # dist = dist,
+                            reduction = 'umap',
+                            method = 'Euclidean',
+                            average = T
+                            )
+silhouttes
+paste0('Mean cluster silhouette Seurat: ', mean(silhouttes$sil_width))
+
+res.mfms
+
+res.mfms.ds = res.mfms$data[sample(1:nrow(res.mfms$data), 10000),]
+sil.samap = FindSilhouette(res.mfms.ds, 
+                            group.by = 'leiden_clusters', 
+                            dist = dist(res.mfms.ds[,c('UMAP_1', 'UMAP_2')]),
+                            # reduction = 'umap',
+                            # method = 'Euclidean',
+                            average = T
+                            )
+paste0('Mean cluster silhouette SAMap: ', mean(sil.samap$sil_width))
+```
+
 ## Checkpoint: Heatmap 1
 
 ```{r, fig.height=3, fig.width=10, dpi=300}
@@ -4697,13 +4873,12 @@ dev.off()
 
 # Figure 7: similarity to RGCs
 
-## Revisiting the co-evolution analysis
+## Diversity correlation analysis
 
 ```{r, fig.height=4, fig.width=12}
 # Just metadata
 metaList = ReadSAMapObjects(new.lamprey = TRUE, nonmammals = TRUE, mammals = TRUE, mouse = TRUE, new = FALSE, metadata = TRUE)
 ```
-
 
 ```{r, fig.height=4, fig.width=12}
 # Tabulate the number of ACs
@@ -4776,95 +4951,165 @@ saveRDS(ws.df, 'metadata/ws.df.rds')
 # ws.df = subset(ws.df, species != 'Killifish')
 ```
 
-```{r, fig.height=4, fig.width=3.4}
+```{r, fig.height=4, fig.width=4}
 ws.df = readRDS('metadata/ws.df.rds')
 this_theme = function(){ theme_cowplot(font_family = 'ArialMT')}
-
-library(ggbreak) 
 
 # Main figure
 ScatterPlot(ws.df, 
             x = 'RGC.clusters', 
             y = 'AC.clusters', 
             lm = T, 
-            r_pval = T, 
+            r_pval = F, 
             labels = 'species',
             max.overlaps = 100, 
             xlab = '# of RGC clusters', 
             ylab = '# of AC clusters', 
             fill = 'species', 
-            pt.size = 2) + 
+            pt.size = 2, label.size = 3.5, box.padding = 0.6) + 
   scale_fill_manual(values = lighten(species_palette3, 0.3)) + 
-  # scale_x_break(c(0, 15), scales = 1.5)+
-  coord_cartesian(xlim = c(15,46), ylim = c(15, 67))+
-  scale_y_continuous(breaks = seq(15, 60, length.out = 4))+
-  scale_x_continuous(breaks = seq(15, 45, length.out = 3))+
+  # scale_x_break(c(0, 15), scales = 1.5) + 
+  coord_cartesian(xlim = c(0,50), ylim = c(0, 70), expand = 0)+
+  scale_y_continuous(breaks = seq(0, 60, length.out = 4))+
+  scale_x_continuous(breaks = seq(0, 45, length.out = 4))+
+  # scale_ticks_first_last() +
+  # scale_ticks_first_last(axis = 'x') +
   theme_cowplot() + 
-  ArialFont()+
+  ArialFont() +
   NoLegend() 
+
+# ggsave('../../figures/my_figs/fig-ac-rgc-cor-main.pdf', width = 3.5, height = 3.5)
+```
+
+```{r}
+ws.df = readRDS('metadata/ws.df.rds')
+ws.df$species = species_names_pretty(ws.df$species)
+rownames(ws.df) = ws.df$species
+dendro = readRDS('../../Ortho_Objects/phylo.hs.pm.sorted.dendro.rds')
+# pruned = prune(dendro, setdiff(labels(dendro), levels(summary.cor$Species)))
+tree = as.phylo(dendro)
+plot(tree)
+# tree$tip.label = species_names_pretty(tree$tip.label)
+pruned = drop.tip(tree, setdiff(tree$tip.label, ws.df$species))
+plot(pruned)
+
+library(phylolm)
+fit <- phylolm(BC.clusters ~ RGC.clusters, data = ws.df, phy = pruned, model = "lambda")
+summary(fit)
+
+# fit_null <- phylolm(RGC.clusters ~ AC.clusters, 
+#                     data = ws.df, phy = pruned, 
+#                     model = "BM")
+# 
+# summary(fit_null)
 ```
 
 
+```{r}
+# Run all the comparisons through phylolm
+comparisons = list(c('RGC.clusters', 'AC.clusters'), 
+                   c('BC.clusters', 'AC.clusters'), 
+                   c('BC.clusters', 'RGC.clusters'), 
+                   c('RGC.simpson', 'AC.simpson'), 
+                   c('BC.simpson', 'AC.simpson'), 
+                   c('BC.simpson', 'RGC.simpson'), 
+                   c('AC.cells', 'AC.clusters'), 
+                   c('RGC.cells', 'RGC.clusters'), 
+                   c('BC.cells', 'BC.clusters'))
+
+pgls = do.call(rbind, lapply(comparisons, function(comparison){
+  message("trying comparsion ", paste0(comparison, collapse = ', '))
+  # browser()
+  fit <- phylolm(eval(parse(text = comparison[[1]])) ~ eval(parse(text = comparison[[2]])),
+                 data = ws.df, 
+                 phy = pruned, 
+                 model = "lambda")
+  mod_summary = summary(fit)
+  pval = mod_summary$coefficients[, "p.value"][[2]]
+  r.squared = mod_summary$r.squared
+  data.frame(comparison = paste0(comparison, collapse = '-'), 
+             pval = pval, 
+             r.squared = r.squared)
+}))
+
+pgls <- results %>%
+  mutate(label_text = case_when(
+    pval < 0.001 ~ paste0("R^2 == ", round(r.squared, 2), 
+                          "* ',' ~ italic(p) == ", 
+                          # Convert 1.2e-04 to 1.2 %*% 10^-4
+                          gsub("e", " %*% 10^", format(pval, scientific = TRUE, digits = 2))),
+    TRUE         ~ paste0("R^2 == ", round(r.squared, 2), 
+                          "* ',' ~ italic(p) == ", round(pval, 2))
+  ))
+
+pgls
+```
+
+
+
 ```{r, fig.height=4, fig.width=12}
-# Highly significant association that could not be explained by sampling
-ScatterPlot(ws.df, x = 'RGC.clusters', y = 'AC.clusters', lm = T, r_pval = T, labels = 'species', max.overlaps = 100, 
-            xlab = '# of RGC clusters', ylab = '# of AC clusters', fill = 'species', pt.size = 2) + 
-  scale_fill_manual(values = lighten(species_palette3, 0.3)) + 
-  theme_cowplot() + 
-  ArialFont()+
-  NoLegend() | 
-  ScatterPlot(ws.df, x = 'BC.clusters', y = 'AC.clusters', lm = T, r_pval = T, labels = 'species', max.overlaps = 100, 
-              xlab = '# of BC clusters', ylab = '# of AC clusters', fill = 'species', pt.size = 2) + 
-  scale_fill_manual(values = lighten(species_palette3, 0.3)) + 
-  this_theme()+
-  NoLegend() | 
-  ScatterPlot(ws.df, x = 'BC.clusters', y = 'RGC.clusters', lm = T, r_pval = T, labels = 'species', max.overlaps = 100, 
-              xlab = '# of BC clusters', ylab = '# of RGC clusters', fill = 'species', pt.size = 2) + 
-  scale_fill_manual(values = lighten(species_palette3, 0.3)) + 
-  this_theme() + 
-  NoLegend() 
+this_theme = function(){ theme_cowplot(font_family = 'ArialMT')}
+
+
+# Number of clusters
+p1 <- ScatterPlot(ws.df, x = 'RGC.clusters', y = 'AC.clusters', lm = F, r_pval = F, labels = 'species', max.overlaps = 100, 
+                  xlab = '# of RGC clusters', ylab = '# of AC clusters', fill = 'species', pt.size = 2) + 
+  scale_fill_manual(values = lighten(species_palette3, 0.3)) + theme_cowplot() + ArialFont() +
+  geom_text(data = pgls[1,], aes(x = Inf, y = -Inf, label = label_text), hjust=1.1, vjust=-0.5, parse = TRUE, size = 4, inherit.aes = FALSE) + NoLegend()
+
+p2 <- ScatterPlot(ws.df, x = 'BC.clusters', y = 'AC.clusters', lm = F, r_pval = F, labels = 'species', max.overlaps = 100, 
+                  xlab = '# of BC clusters', ylab = '# of AC clusters', fill = 'species', pt.size = 2) + 
+  scale_fill_manual(values = lighten(species_palette3, 0.3)) + this_theme() +
+  geom_text(data = pgls[2,], aes(x = Inf, y = -Inf, label = label_text), hjust=1.1, vjust=-0.5, parse = TRUE, size = 4, inherit.aes = FALSE) + NoLegend()
+
+p3 <- ScatterPlot(ws.df, x = 'BC.clusters', y = 'RGC.clusters', lm = F, r_pval = F, labels = 'species', max.overlaps = 100, 
+                  xlab = '# of BC clusters', ylab = '# of RGC clusters', fill = 'species', pt.size = 2) + 
+  scale_fill_manual(values = lighten(species_palette3, 0.3)) + this_theme() + 
+  geom_text(data = pgls[3,], aes(x = Inf, y = -Inf, label = label_text), hjust=1.1, vjust=-0.5, parse = TRUE, size = 4, inherit.aes = FALSE) + NoLegend()
+
+p1 | p2 | p3
 ggsave('../../figures/my_figs/fig-ac-rgc-bc-cor.pdf', width = 10.5, height = 3.5)
 
+
+
 # Simpson index
-ScatterPlot(ws.df, x = 'RGC.simpson', y = 'AC.simpson', lm = T, r_pval = T, labels = 'species', max.overlaps = 100, 
-            xlab = 'RGC Simpson index', ylab = 'AC Simpson index', fill = 'species', pt.size = 2) + 
-  scale_fill_manual(values = lighten(species_palette3, 0.3)) + 
-  this_theme() + 
-  NoLegend()  | 
-  ScatterPlot(ws.df, x = 'BC.simpson', y = 'AC.simpson', lm = T, r_pval = T, labels = 'species', max.overlaps = 100, 
-              xlab = 'BC Simpson index', ylab = 'AC Simpson index', fill = 'species', pt.size = 2) + 
-  scale_fill_manual(values = lighten(species_palette3, 0.3)) + 
-  this_theme() + 
-  NoLegend()  | 
-  ScatterPlot(ws.df, x = 'BC.simpson', y = 'RGC.simpson', lm = T, r_pval = T, labels = 'species', max.overlaps = 100, 
-              xlab = 'BC Simpson index', ylab = 'RGC Simpson index', fill = 'species', pt.size = 2) + 
-  scale_fill_manual(values = lighten(species_palette3, 0.3)) + 
-  this_theme() + 
-  NoLegend() 
+p4 <- ScatterPlot(ws.df, x = 'RGC.simpson', y = 'AC.simpson', lm = F, r_pval = F, labels = 'species', max.overlaps = 100, 
+                  xlab = 'RGC Simpson index', ylab = 'AC Simpson index', fill = 'species', pt.size = 2) + 
+  scale_fill_manual(values = lighten(species_palette3, 0.3)) + this_theme() +
+  geom_text(data = pgls[4,], aes(x = Inf, y = -Inf, label = label_text), hjust=1.1, vjust=-0.5, parse = TRUE, size = 4, inherit.aes = FALSE) + NoLegend()
+
+p5 <- ScatterPlot(ws.df, x = 'BC.simpson', y = 'AC.simpson', lm = F, r_pval = F, labels = 'species', max.overlaps = 100, 
+                  xlab = 'BC Simpson index', ylab = 'AC Simpson index', fill = 'species', pt.size = 2) + 
+  scale_fill_manual(values = lighten(species_palette3, 0.3)) + this_theme() +
+  geom_text(data = pgls[5,], aes(x = Inf, y = -Inf, label = label_text), hjust=1.1, vjust=-0.5, parse = TRUE, size = 4, inherit.aes = FALSE) + NoLegend()
+
+p6 <- ScatterPlot(ws.df, x = 'BC.simpson', y = 'RGC.simpson', lm = F, r_pval = F, labels = 'species', max.overlaps = 100, 
+                  xlab = 'BC Simpson index', ylab = 'RGC Simpson index', fill = 'species', pt.size = 2) + 
+  scale_fill_manual(values = lighten(species_palette3, 0.3)) + this_theme() +
+  geom_text(data = pgls[6,], aes(x = Inf, y = -Inf, label = label_text), hjust=1.1, vjust=-0.5, parse = TRUE, size = 4, inherit.aes = FALSE) + NoLegend()
+
+p4 | p5 | p6
 ggsave('../../figures/my_figs/fig-ac-rgc-bc-simpson.pdf', width = 10.5, height = 3.5)
 
-# ScatterPlot(ws.df, x = 'AC.cells', y = 'RGC.cells', lm = T, r_pval = T, labels = 'species', max.overlaps = 100)
+
 
 # No stable relationship between # of AC cells and # of RGC cells recovered, suggesting its not simply due to higher sampling of certain species
+p7 <- ScatterPlot(ws.df, x = 'AC.cells', y = 'AC.clusters', lm = F, r_pval = F, 
+                  xlab = '# of AC cells', ylab = '# of AC clusters', labels = 'species', max.overlaps = 100, logX = TRUE, fill = 'species', pt.size = 2) + 
+  scale_fill_manual(values = lighten(species_palette3, 0.3)) + theme_cowplot() +
+  geom_text(data = pgls[7,], aes(x = Inf, y = -Inf, label = label_text), hjust=1.1, vjust=-0.5, parse = TRUE, size = 4, inherit.aes = FALSE) + NoLegend()
 
-ScatterPlot(ws.df, x = 'AC.cells', y = 'AC.clusters', lm = T, r_pval = T, 
-            xlab = '# of AC cells', ylab = '# of AC clusters',
-            labels = 'species', max.overlaps = 100, logX = TRUE, fill = 'species', pt.size = 2) + 
-  scale_fill_manual(values = lighten(species_palette3, 0.3)) + 
-  theme_cowplot() + 
-  NoLegend() | 
-  ScatterPlot(ws.df, x = 'RGC.cells', y = 'RGC.clusters', lm = T, r_pval = T, 
-              xlab = '# of RGC cells', ylab = '# of RGC clusters',
-              labels = 'species', max.overlaps = 100, logX = TRUE, fill = 'species', pt.size = 2)+ 
-  scale_fill_manual(values = lighten(species_palette3, 0.3)) + 
-  theme_cowplot() + 
-  NoLegend() | 
-  ScatterPlot(ws.df, x = 'BC.cells', y = 'BC.clusters', lm = T, r_pval = T, 
-              xlab = '# of BC cells', ylab = '# of BC clusters',
-              labels = 'species', max.overlaps = 100, logX = TRUE, fill = 'species', pt.size = 2)+ 
-  scale_fill_manual(values = lighten(species_palette3, 0.3)) + 
-  theme_cowplot() + 
-  NoLegend() 
+p8 <- ScatterPlot(ws.df, x = 'RGC.cells', y = 'RGC.clusters', lm = F, r_pval = F, 
+                  xlab = '# of RGC cells', ylab = '# of RGC clusters', labels = 'species', max.overlaps = 100, logX = TRUE, fill = 'species', pt.size = 2)+ 
+  scale_fill_manual(values = lighten(species_palette3, 0.3)) + theme_cowplot() +
+  geom_text(data = pgls[8,], aes(x = Inf, y = -Inf, label = label_text), hjust=1.1, vjust=-0.5, parse = TRUE, size = 4, inherit.aes = FALSE) + NoLegend()
+
+p9 <- ScatterPlot(ws.df, x = 'BC.cells', y = 'BC.clusters', lm = F, r_pval = F, 
+                  xlab = '# of BC cells', ylab = '# of BC clusters', labels = 'species', max.overlaps = 100, logX = TRUE, fill = 'species', pt.size = 2)+ 
+  scale_fill_manual(values = lighten(species_palette3, 0.3)) + theme_cowplot() +
+  geom_text(data = pgls[9,], aes(x = Inf, y = -Inf, label = label_text), hjust=1.1, vjust=-0.5, parse = TRUE, size = 4, inherit.aes = FALSE) + NoLegend()
+
+p7 | p8 | p9
 ggsave('../../figures/my_figs/fig-ac-rgc-bc-sampling.pdf', width = 10.5, height = 3.5)
 ```
 
@@ -4913,7 +5158,6 @@ ScatterPlot(ws.df, x = 'RGC.clusters', y = 'AC.clusters', lm = T, r_pval = T, la
   scale_y_continuous(limits = c(0,70)) + 
   scale_x_continuous(limits = c(0,50))
 ```
-
 
 ## Correlograms
 

@@ -1,5 +1,840 @@
 # Dario's functions!
 
+
+compare_frequency = function(object){
+  
+  # 1. Pre-calculate totals to avoid repeated subsetting
+  total_sc    <- sum(object$species == "scRNA-seq")
+  total_xen   <- sum(object$species == "Xenium")
+  
+  # 2. Build the dataframe
+  count.df <- data.frame(
+    type = as.numeric(ExtractString(names(table(object$harmony.AC)), before = '_')), 
+    
+    scRNAseq = as.vector(
+      table(object$harmony.AC[object$species == "scRNA-seq"]) / total_sc
+    ), 
+    
+    Xenium_harmony = as.vector(
+      table(object$harmony.AC[object$species == "Xenium"]) / total_xen
+    )
+  )
+  
+  count.df = arrange(count.df, type)
+  ScatterPlot(count.df, 'scRNAseq', 'Xenium_harmony', labels = 'type', y_equals_x = T, r = T, logX = T, logY = T, max.overlaps = 10) | 
+    ScatterPlot(count.df, 'scRNAseq', 'Xenium_harmony', labels = 'type', y_equals_x = T, r = T, max.overlaps = 10)
+
+}
+
+compute_retinal_regularity <- function(coords, concavity = 2, sample_size = 10000) {
+  
+  library(spatstat)
+  library(concaveman)
+  library(sf)
+  library(ggplot2)
+  
+  # coords: data.frame with 'x' and 'y' columns
+  
+  # 1. Generate the Concave Hull
+  # We convert to sf to calculate area accurately within the "patches"
+  pts_sf <- st_as_sf(as.data.frame(coords), coords = c("x", "y"))
+  hull <- concaveman(pts_sf, concavity = concavity)
+  hull_area <- as.numeric(st_area(hull))
+  num_points <- nrow(coords)
+  
+  # 2. NN Math for Retinal Regularity Index (Mean / SD)
+  # nndist is efficient for large datasets
+  dist_nn <- nndist(coords[,1], coords[,2])
+  
+  mu <- mean(dist_nn)
+  sigma <- sd(dist_nn)
+  
+  # This is the "Regularity Index" (RI) used in retinal anatomy
+  # Random ~ 1.7-2.0 | Regular/Mosaic ~ 4.0+
+  RI <- mu / sigma
+  
+  # 3. Diagnostic Plotting
+  # We sample points to prevent ggplot from hanging with 800k points
+  plot_pts <- if(nrow(coords) > sample_size) {
+    coords[sample(1:nrow(coords), sample_size), ]
+  } else {
+    coords
+  }
+  
+  diag_plot <- ggplot() +
+    geom_sf(data = hull, fill = "lightblue", alpha = 0.2, color = "blue", size = 0.5) +
+    geom_point(data = as.data.frame(plot_pts), aes(x, y), size = 0.2, alpha = 0.3, color = "black") +
+    labs(
+      title = paste("Nearest neighbor regularity index (RI) =", round(RI, 3)),
+      subtitle = paste("Mean NN Dist:", round(mu, 2), "µm | SD:", round(sigma, 2)),
+      caption = paste("Concavity:", concavity, "| Area:", round(hull_area, 0), "µm²")
+    ) +
+    theme_minimal()
+  
+  # 4. Return results
+  return(list(
+    stats = data.frame(
+      regularity_index = RI,
+      mean_nn_dist = mu,
+      sd_nn_dist = sigma,
+      n_cells = num_points,
+      area = hull_area
+    ),
+    plot = diag_plot
+  ))
+}
+
+ProperCase <- function(x) {
+  # 1. Convert everything to lowercase first
+  x <- tolower(x)
+  
+  # 2. Extract the first letter, uppercase it, and paste it back to the rest
+  # We use substring() to get the string from the 2nd character to the end
+  paste0(toupper(substr(x, 1, 1)), substring(x, 2))
+}
+
+
+# Helper function for safe indexing
+safe_subset <- function(m, rows, cols, impute = NA) {
+  m_sub <- m[match(rows, rownames(m)), match(cols, colnames(m)), drop = FALSE]
+  rownames(m_sub) <- rows
+  colnames(m_sub) <- cols
+  
+  
+  m_sub[is.na(m_sub)] = impute
+  as.data.frame.matrix(m_sub)
+}
+
+
+barplot_blast = function(df, n = 10){
+  
+  # vector = df$bitscore %>% setNames(df$species2)
+  # QuickBarplot(head(vector, n))
+  
+  df.sorted = df %>%
+    group_by(species1) %>%
+    slice_max(bitscore, n = n)
+  
+  ggbarplot(df.sorted, x = 'species2', y = 'bitscore', facet.by = 'species1', scales = "free_x") %>%
+    facet(facet.by = "species1", nrow = 1, scales = 'free_x')+
+    RotatedAxis()
+  
+}
+
+run_phylo_pipeline <- function(prefix, target_genes, sequences, species_index, redo = FALSE) {
+  
+  # Define file paths based on the prefix
+  raw_path      <- paste0("protein_trees/", prefix, "_raw.fa")
+  aligned_path  <- paste0("protein_trees/", prefix, "_aligned.fa")
+  trimmed_path  <- paste0("protein_trees/", prefix, "_trimmed.fa")
+  treefile_path <- paste0(trimmed_path, '.treefile')
+  
+  files_exist <- file.exists(raw_path, aligned_path, trimmed_path, treefile_path)
+  
+  if (all(files_exist) && !redo) {
+    message("Files already exist for prefix '", prefix, "'. Plotting existing tree. Use redo=TRUE to rerun.")
+  } else {
+    
+    # Process and filter sequences
+    family.sequences = AAStringSet(unlist(lapply(seq_along(sequences), function(i) {
+      
+      seq = sequences[[i]]
+      
+      # Filter by the target gene list
+      seq = seq[toupper(names(seq)) %in% toupper(target_genes)]
+      
+      # Check if any sequences remained after filtering
+      if(length(seq) == 0) return(NULL)
+      
+      # Name sequences using the species index
+      names(seq) = paste0(rownames(species_index)[[i]], '-', names(seq))
+      
+      # 1. Sort by gene name, then by width (descending)
+      df = data.frame(width = width(seq),
+                      gene = names(seq),
+                      index = 1:length(seq))
+      df_sorted <- df[order(df$gene, -df$width), ]
+      
+      # 2. Keep only the first occurrence of each gene name (longest)
+      df_longest <- df_sorted[!duplicated(df_sorted$gene), ]
+      
+      # 3. Subset sequences using the index
+      seqs_filtered <- seq[df_longest$index]
+      
+      as.character(seqs_filtered)
+    })))
+    
+    # Write raw sequences
+    writeXStringSet(family.sequences, filepath = raw_path, format = "fasta")
+    
+    # Align with Muscle
+    system(paste0('muscle -align ', raw_path, ' -output ', aligned_path))
+    
+    # Trim with trimAl
+    system(paste0('trimal -in ', aligned_path, ' -out ', trimmed_path, ' -automated1'))
+    
+    # Run IQTree2 (pass -redo flag if requested)
+    redo_flag <- if (redo) ' -redo' else ''
+    system(paste0('iqtree2 -s ', trimmed_path, ' -m MFP -bb 1000 -alrt 1000 -nt AUTO', redo_flag))
+  }
+  
+  # Plot the resulting treefile
+  my_tree <- read.tree(treefile_path)
+  plot(my_tree)
+  nodelabels(my_tree$node.label, adj = c(1.2, -0.5), frame = "none", cex = 0.7)
+  
+  return(readAAStringSet(trimmed_path))
+}
+
+BatchVarExp = function(object, 
+                       group.by, 
+                       reduction = c('pca', 'harmony'), 
+                       var.type = 'auto',
+                       n_cells = 100000, 
+                       seed = 12345){
+  
+  # Extract embedding
+  embedding <- Embeddings(object, reduction = reduction)
+  
+  # Extract metadata
+  meta <- object@meta.data
+  
+  # Subsample to N cells
+  set.seed(seed)
+  if(n_cells < ncol(object)){
+    idx <- sample(ncol(object), n_cells)
+    embedding_sub <- embedding[idx, ]
+    meta_sub <- meta[idx, ]
+  } else {
+    embedding_sub = embedding
+    meta_sub = meta
+  }
+  
+  covariate <- meta_sub[[group.by]]
+  
+  # Auto-detect variable type if not specified
+  if(var.type == 'auto'){
+    var.type <- ifelse(is.numeric(covariate) & length(unique(covariate)) > 20,
+                       'continuous', 'categorical')
+    message("Detected var.type: ", var.type)
+  }
+  
+  # Coerce based on type
+  if(var.type == 'categorical'){
+    covariate <- as.factor(covariate)
+  } else if(var.type == 'continuous'){
+    covariate <- as.numeric(covariate)
+  }
+  
+  # Compute multivariate R²
+  grand_mean <- colMeans(embedding_sub)
+  SS_total <- sum(rowSums((embedding_sub - grand_mean)^2))
+  
+  fit <- lm(embedding_sub ~ covariate)
+  SS_model <- sum(rowSums((fitted(fit) - grand_mean)^2))
+  
+  r.squared <- SS_model / SS_total
+  r.squared
+}
+
+amari_score <- function(mat) {
+  
+  N_col <- ncol(mat)
+  N_row <- ncol(mat)
+  
+  col_max <- sum(apply(mat, 2, max))  # for each column, sum best value
+  row_max <- sum(apply(mat, 1, max))  # for each row, sum best value
+  
+  best_score = N_col + N_row
+  diss <- (col_max + row_max) / best_score
+  diss
+}
+
+format_p <- function(p) {
+  if (p < 0.001) {
+    # Convert to scientific notation string: "3.2e-04" -> "3.2 %*% 10^-4"
+    formatted <- format(p, scientific = TRUE, digits = 3)
+    formatted <- gsub("e", " %*% 10^", formatted)
+    # Remove leading plus signs in exponent if they exist
+    formatted <- gsub("\\+", "", formatted)
+    return(paste0(" == ", formatted))
+  } else {
+    return(paste0(" == ", round(p, 3)))
+  }
+}
+
+convert_ids = function(ids, dataset = "mfascicularis_gene_ensembl"){
+  # 2. Connect to the Ensembl BioMart
+  # We use the Macaque dataset as our starting point
+  mart <- useMart("ensembl", dataset = dataset)
+  
+  # 4. Run the query
+  # 'ensembl_gene_id' is the Macaque ID (the filter)
+  # 'hsapiens_homolog_associated_gene_name' is the Human Gene Symbol (the attribute)
+  ortholog_map <- getBM(
+    attributes = c(
+      "ensembl_gene_id", 
+      "hsapiens_homolog_associated_gene_name",
+      "hsapiens_homolog_orthology_type"
+    ),
+    filters = "ensembl_gene_id",
+    values = ids,
+    mart = mart
+  )
+  
+  # 5. View results
+  ortholog_map = subset(ortholog_map, hsapiens_homolog_orthology_type == 'ortholog_one2one')
+  ortholog_map$hsapiens_homolog_associated_gene_name
+}
+
+process_ortho_heatmap <- function(csv_path, 
+                                  title_label = "Bridge Heatmap",
+                                  cluster_col = "leiden_clusters_4.5",
+                                  index_ref = index, 
+                                  ortho_ref = ac.ortho,
+                                  ortho_levels = ORTHOTYPES, 
+                                  stagger.threshold) {
+  
+  ac.umap = as.data.frame(fread(csv_path)) 
+  ac.umap$leiden_clusters = ac.umap[[cluster_col]]
+  ac.umap$species_full = convert_values(ac.umap$species, index$species %>% setNames(index$ident))
+  ac.umap$species_full = factor(factor(ac.umap$species_full, levels = index$species))
+  
+  # Just the lizard, because it has '-1' suffix
+  ac.umap$orthotypes_li = ac.ortho$type[paste0(ac.umap$species_full, '_', apply(str_split_fixed(ac.umap$V1, '-', 3)[,1:2], 1, paste, collapse = '-'))]
+  
+  # Chicken, opossum, mouse, and macaque ('x' suffix)
+  ac.umap$orthotypes_ch = ac.ortho$type[paste0(ac.umap$species_full, '_', ExtractString(ac.umap$V1, after = '-'))]
+  
+  # Combine orthotype labels
+  ac.umap$orthotypes = ifelse(is.na(ac.umap$orthotypes_li), as.character(ac.umap$orthotypes_ch), as.character(ac.umap$orthotypes_li))
+  ac.umap$orthotypes = orthotype_labels(ac.umap$orthotypes, as.factor = FALSE)
+  
+  message('Using species: ', unique(ac.umap$species[!is.na(ac.umap$orthotypes)]), ' for cross-tabulation!')
+  
+  # Gemini was messing up here, which is why it looked different
+  # # 3. Orthotype Extraction
+  # # Extracting prefix (V1 parts 1 & 2) and suffix (after '-')
+  # df = ac.umap
+  # v1_parts <- stringr::str_split_fixed(df$V1, '-', 3)
+  # v1_prefix <- apply(v1_parts[, 1:2], 1, paste, collapse = '-')
+  # 
+  # # Using your custom ExtractString or stringr alternative
+  # v1_suffix <- stringr::str_extract(df$V1, "(?<=-).*") 
+  # 
+  # # Mapping from ac.ortho reference
+  # df$orthotypes_li <- ortho_ref$type[paste0(df$species_full, '_', v1_prefix)]
+  # df$orthotypes_ch <- ortho_ref$type[paste0(df$species_full, '_', v1_suffix)]
+  # df$orthotypes <- ifelse(is.na(df$orthotypes_li), 
+  #                         as.character(df$orthotypes_ch), 
+  #                         as.character(df$orthotypes_li))
+  
+  # Tabulation and counting
+  js_mat = JSMatrix(table(factor(ac.umap$orthotypes, ORTHOTYPES), ac.umap$leiden_clusters))
+  
+  ari = round(adj.rand.index(factor(ac.umap$orthotypes, ORTHOTYPES), ac.umap$leiden_clusters), 2)
+  # message('ARI: ')
+
+  # 5. Plotting
+  p <- JSHeatmap2(
+    factor(ac.umap$orthotypes, ortho_levels), ac.umap$leiden_clusters,
+    stagger.threshold = stagger.threshold,
+    row.order = ortho_levels,
+    border.col = NA,
+    title = paste0(title_label, '\n ARI: ', ari)
+  ) +
+    ArialFont() +
+    theme(
+      axis.text.y = element_text(size = 6, color = 'black'),
+      axis.ticks.length.y = unit(1, "pt"),
+      axis.ticks = element_blank(),
+      axis.text.x = element_blank(),
+      plot.background = element_rect(fill = "transparent", colour = NA)
+    ) +
+    scale_y_discrete(position = "right") + 
+    NoLegend()
+  
+  # Final Arrangement
+  # final_plot <- ggpubr::ggarrange(
+  #   p,
+  #   common.legend = TRUE,
+  #   legend = 'none'
+  # )
+  
+  return(list(data = ac.umap, matrix = js_mat, plot = p))
+}
+
+
+get_numbers <- function(string_vector) {
+  # str_extract (singular) returns a vector, not a list
+  matches <- str_extract(string_vector, "-?\\d+\\.?\\d*")
+  
+  # Convert to numeric (non-matches stay as NA)
+  return(as.numeric(matches))
+}
+
+
+FindMode = function(vec){
+  names(tail(sort(table(vec)), 1))
+  
+}
+
+FindSilhouette = function(object, 
+                          group.by, 
+                          reduction = 'harmony', 
+                          dist = NULL, 
+                          average = TRUE, 
+                          method = 'cosine'){
+  
+  # Load library
+  library(cluster)
+  
+  # Dist can be precomputed
+  if(is.null(dist)) dist = proxy::dist(object@reductions[[reduction]]@cell.embeddings, method = method)
+  
+  # Compute cell-wise scores
+  if(inherits(object, 'Seurat')){
+    cell.scores = as.data.frame(silhouette(as.integer(object@meta.data[[group.by]]), 
+                                           dist))
+  } else {
+    cell.scores = as.data.frame(silhouette(as.integer(object[[group.by]]), 
+                                           dist))
+  }
+  
+  # Per cell score? 
+  if(!average) return(cell.scores)
+  
+  # Average score per cluster
+  avg.sil = as.data.frame(aggregate(sil_width ~ cluster, data = cell.scores, FUN = mean))
+  avg.sil
+}
+
+ReadFile <- function(path) {
+  ext <- tools::file_ext(path)
+  if(ext == "rds") {
+    readRDS(path)
+  } else if(ext == "qs2") {
+    qs2::qs_read(path)
+  } else {
+    stop("Unsupported file extension: ", ext, ". Expected .rds or .qs2")
+  }
+}
+
+QuickBarplot = function(vector, ...){
+  
+  summary = data.frame(group = names(vector), 
+                       value = vector)
+  
+  PrettyBarplot(summary, x = 'group', y = 'value', ...)
+}
+
+
+DotPlot4 <- function(object, 
+                     coord.flip = FALSE, 
+                     max.pct = 100,
+                     binarization = NULL, 
+                     col.high = '#584B9FFF', 
+                     col.low = 'lightgrey', 
+                     show = NULL,
+                     max.size = 6,
+                     str_width = 20,
+                     gene.groups = NULL, # named vector: names = genes, values = group labels
+                     facet.ncol = NULL,  # passed to facet_wrap
+                     ...){
+  
+  args = list(...)
+  args$object = object
+  args$col.min = -1
+  args$col.max = 2
+  
+  if(!is.null(gene.groups)) {
+    args$features = unlist(gene.groups)
+    
+    # Str wrapping
+    names(gene.groups) = stringr::str_wrap(names(gene.groups), width = str_width)
+  }
+  
+  if(coord.flip) {
+    message('reversing order of genes for y-axis...')
+    args$features = rev(args$features)
+  } 
+  # Remove features that are not present
+  args$features = intersect(args$features, rownames(object))
+  stopifnot(length(args$features) > 0)
+  # Generate DotPlot data
+  dot_data <- do.call(DotPlot, args)$data
+  dot_data$key = paste0(dot_data$features.plot, '-', dot_data$id)
+  # Scale the 'pct.exp' column
+  dot_data$pct.exp <- pmin(dot_data$pct.exp, max.pct)
+  if(!coord.flip){
+    dot_data$id = factor(dot_data$id, levels = rev(levels(dot_data$id)))
+  }
+  if(!is.null(binarization)){
+    bin.melt = reshape2::melt(binarization)
+    bin.melt$key = paste0(bin.melt$Var1, '-', bin.melt$Var2)
+    dot_data = dot_data[match(bin.melt$key, dot_data$key),]
+    dot_data$heat_value = factor(bin.melt$value, levels = c(0,1))
+  }
+  # Add gene group annotation if provided
+  if(!is.null(gene.groups)){
+    if(inherits(gene.groups, 'list')) {
+      gene.names = unlist(gene.groups)
+      gene.groups = rep(names(gene.groups), sapply(gene.groups, length))
+      names(gene.groups) = gene.names
+    }
+    dot_data$gene.group = gene.groups[as.character(dot_data$features.plot)]
+    
+    # Preserve group order as provided
+    dot_data$gene.group = factor(dot_data$gene.group, levels = unique(gene.groups))
+  }
+  if(is.null(show)) show = unique(dot_data$id)
+  
+  
+  # Remove NAs
+  # dot_data = na.omit(dot_data)
+  
+  
+  # Plot
+  ggplot(subset(dot_data, id %in% show), aes(x = features.plot, y = id)) +
+    {if(!is.null(binarization)) geom_tile(aes(fill = heat_value))} +
+    {if(!is.null(binarization)) scale_fill_manual(values = c("0" = "white", "1" = "lightgrey"))} +
+    geom_point(aes(size = pct.exp, color = avg.exp.scaled)) +
+    theme_cowplot() +
+    {if(coord.flip) coord_flip()} +
+    {if(coord.flip) theme(axis.title = element_blank(), axis.text.y = element_text(face = 'italic'))} + 
+    {if(!coord.flip) theme(axis.title = element_blank(), axis.text.x = element_text(face = 'italic'))} +
+    RotatedAxis() + 
+    scale_color_gradient(name = 'Scaled\nexpression', 
+                         low = col.low, 
+                         high = col.high, 
+                         limits = c(-1, 2), 
+                         guide = guide_colorbar(frame.colour = "black", ticks.colour = "black")) +
+    scale_radius(name = 'Percent\nexpressed', limits = c(0, max.pct), range = c(0, max.size)) +
+    ArialFont() +
+    {if(!is.null(gene.groups) &&  coord.flip) facet_grid(gene.group ~ ., scales = "free_y", space = "free_y")} +
+    {if(!is.null(gene.groups) && !coord.flip) facet_grid(. ~ gene.group, scales = "free_x", space = "free_x")}
+}
+
+BestResCurve = function(object, from = 0.04, to = 0.2, by = 0.01){
+  res = seq(from = from, to = to, by = by)
+  values = ResolutionSweep(object, from = from, to = to, by = by, FUN = function(x) 
+    mean(silhouette(as.integer(x), dist(object@reductions$harmony@cell.embeddings))[,'sil_width']))
+  
+  plot(res, values)
+  
+  # FindClusters(object, resolution = res[which.max(values)])
+}
+
+overlap_p = function(list1, list2, population = 17000){
+  intersection = intersect(list1, list2)
+  phyper(length(intersection)-1,
+         length(list1),
+         population-length(list1),
+         length(list2),
+         lower.tail=FALSE, 
+         log.p=FALSE)
+}
+
+DegOverlap = function(obj1, obj2, group.by = 'seurat_clusters', n = 50, 
+                      return.genes = FALSE, plot = FALSE, DEG_FUN = TopNDEGs, 
+                      use.hyper = FALSE, p.adjust = TRUE, population = 17000, ...){
+  
+  if(inherits(obj1, 'Seurat')){
+    de1 = DEG_FUN(obj1, group.by = group.by, n = n)
+    genes1 <- split(de1$gene, de1$cluster) 
+  } else {
+    genes1 = obj1
+  }
+  
+  if(inherits(obj2, 'Seurat')){
+    de2 = DEG_FUN(obj2, group.by = group.by, n = n)
+    genes2 <- split(de2$gene, de2$cluster)
+  } else {
+    genes2 = obj2
+  }
+  
+  overlap_matrix <- sapply(genes2, function(a) {
+    sapply(genes1, function(b) {
+        length(intersect(a, b))
+      })
+  })
+  
+  stat_matrix <- sapply(genes2, function(a) {
+    sapply(genes1, function(b) {
+      if(use.hyper){
+        overlap_p(a, b, population = population)
+      } else {
+        jaccard(a, b)
+      }
+      
+    })
+  })
+  
+  if(use.hyper & p.adjust){
+    stat_matrix <- matrix(p.adjust(stat_matrix, method = "BH"),
+              nrow = nrow(stat_matrix),
+              ncol = ncol(stat_matrix),
+              dimnames = dimnames(stat_matrix))
+  }
+  
+  if(use.hyper) stat_matrix = -log10(stat_matrix)
+  
+  if(plot) return(Heatmap2(stat_matrix, 
+                           parenthesis = overlap_matrix, 
+                           label = TRUE, 
+                           legend.name = ifelse(use.hyper, '-log10 pval', 'Jaccard\nindex'), 
+                           ...))
+  
+  return(list(stat_matrix = stat_matrix, 
+              genes = list(genes1 = genes1, genes2 = genes2)))
+  
+}
+
+ResolutionSweep = function(object, from = 0.1, to = 2, by = 0.1, mc.cores = 1, FUN = NULL, algorithm = 4, verbose = FALSE, seed = 12345){
+  
+  resolutions = seq(from, to, by = by)
+  
+  library(parallel)
+  library(pbapply)
+  clusterings = pblapply(resolutions, function(res){
+    obj <- FindClusters(object, resolution = res, verbose = verbose, algorithm = algorithm, seed = seed)
+    return(obj$seurat_clusters)
+  }) # mc.cores = mc.cores
+  
+  names(clusterings) = paste0('RNA_snn_res.', resolutions)
+  
+  # n_k = sapply(clusterings, function(x) length(unique(x)))
+  
+  object@meta.data = cbind(object@meta.data, clusterings)
+  
+  if(!is.null(FUN)){
+    results = dapply(names(clusterings), function(clustering){
+      FUN(object@meta.data[[clustering]])
+    })
+    
+    return(results)
+  } 
+
+  object
+}
+
+
+ShannonEntropy2 = function(vector, threshold = 0, normalize = FALSE){
+  
+  # Early return if all zero
+  if(all(vector == 0)) return(0)
+  
+  # Scale the vector by removing background
+  vector <- vector / sum(vector)
+  vector[vector<threshold] <- 0
+  # Renormalize
+  vector <- vector / sum(vector)
+  # Calculate Shannon entropy
+  Hx <- -sum(vector[vector>0] * log(vector[vector>0]))
+  
+  if(normalize){
+    Hx = Hx / log(length(vector))
+  }
+
+  return(Hx)
+}
+
+MaxARI = function(object, group.by, from = 0.1, to = 2, by = 0.1, mc.cores = 10){
+  
+  resolutions = seq(from, to, by = by)
+  
+  library(parallel)
+  clusterings = mclapply(resolutions, function(res){
+    obj <- FindClusters(object, resolution = res)
+    return(obj$seurat_clusters)
+  }, mc.cores = mc.cores)
+  
+  names(clusterings) = resolutions
+  
+  scores = sapply(clusterings, function(x) adj.rand.index(x, object@meta.data[[group.by]]))
+  print(scores)
+  
+  clusterings[which.max(scores)]
+}
+
+
+BrowseIntegration = function(object, size_type = 3, size_class = 4, clust.cols = NULL, small = FALSE, ...){
+  
+  if(small){
+    (PrettyUmap2(object, group.by = 'species', label = FALSE, show.legend = TRUE, title = 'By species', size = size_class, ...)  + LegendLowerRight() | 
+       PrettyUmap2(object, group.by = 'common_class', geom.label = geom_text_repel, max.overlaps = 100, size = size_class, cols = clust.cols, min.segment.length = 0, title = 'By class', ...))
+  } else {
+    (PrettyUmap2(object, group.by = 'species', label = FALSE, show.legend = TRUE, title = 'By species', size = size_class)  + LegendLowerRight() | 
+       PrettyUmap2(object, group.by = 'common_class', geom.label = geom_text_repel, max.overlaps = 100, size = size_class, cols = clust.cols, min.segment.length = 0, title = 'By class')) /
+    (PrettyUmap2(subset(object, species == 'Human'), group.by = 'cell_type', geom.label = geom_text_repel, max.overlaps = 100, size = size_type, min.segment.length = 0, title = 'Human (type)') | 
+       PrettyUmap2(subset(object, species == 'Mouse'), group.by = 'sn_annotation', geom.label = geom_text_repel, max.overlaps = 100, size = size_type, min.segment.length = 0, title = 'Mouse (type)'))
+  }
+  
+}
+
+
+dtColors = function(n = 435, omit = c('white', 'ivory', 'grey60', 'darkgrey', 'lightyellow', 'lightcyan', 'floralwhite', 'lightcyan1'), lighten.by = 0){
+  colors = standardColors()[which(!standardColors() %in% omit)]
+  if(length(colors) < n) n = length(colors)
+  return(colorspace::lighten(colors[1:n], lighten.by))
+}
+
+labels2colors_dt = function(vector, ...){
+  return(labels2colors(vector, colorSeq = dtColors(length(vector), ...)))
+}
+
+myPalette = function(n_colors, darken = 0.2){
+  # Amacrine palette
+  return(colorspace::darken(as.character(paletteer_c("grDevices::Spectral", n_colors), darken)))
+}
+
+AcPalette2 = function(n = 100, lighten.by = 0.4){
+  colorspace::lighten(dtColors(n), lighten.by)
+}
+
+AcPalette3 = function(n, colors = c('deeppink', 'orange', 'chartreuse', 'cyan', '#584B9FFF', 'violet'), vary.by = 0.4){
+  
+  n.high = ceiling(n / length(colors))
+  # n.low = floor(n / length(colors))
+  col.list = unlist(lapply(colors, function(color) {
+    colorRampPalette(c(color, colorspace::lighten(color, vary.by)))(n.high)
+  }))
+  
+  col.list[1:n]
+}
+
+ClusterPalette2 = function(groups, colors = c('deeppink', 'orange', 'chartreuse', 'cyan', '#584B9FFF', 'violet', 'antiquewhite2'), 
+                           debug = FALSE){
+  
+  levels = table(groups)[unique(groups)]
+  col.list = unlist(lapply(seq_along(levels), function(i) {
+    if(levels[[i]] > 1) {
+      if(debug) browser()
+      interweave(make_hcl_ramp(colors[[i]], levels[[i]]))
+    } else {
+      colors[[i]]
+    }
+  }))
+  
+  col.list
+}
+
+
+ClusterPalette = function(groups, colors = c('deeppink', 'orange', 'chartreuse', 'cyan', '#584B9FFF', 'violet', 'antiquewhite2'), 
+                          vary.by = 0.2, dark.first = TRUE, debug = FALSE){
+  
+  levels = table(groups)[unique(groups)]
+  col.list = unlist(lapply(seq_along(levels), function(i) {
+    if(levels[[i]] > 1) {
+      if(dark.first) {
+        # if(levels[[i]] == 10 & debug) browser()
+        # interweave(make_hcl_ramp(colors[[i]], levels[[i]]))
+        interweave(colorRampPalette(c(colorspace::darken(colors[[i]], vary.by),
+                                      # colors[[i]],
+                                      colorspace::lighten(colors[[i]], vary.by)))(levels[[i]]))
+      } else {
+        interweave(colorRampPalette(c(colorspace::lighten(colors[[i]], vary.by), 
+                                      # colors[[i]],
+                                      colorspace::darken(colors[[i]], vary.by)))(levels[[i]]))
+      }
+    } else {
+      colors[[i]]
+    }
+  }))
+  
+  col.list
+}
+
+DcPalette = function(n_colors, colors = c("violet", "deepskyblue", "chartreuse3", "orange",  "orangered","brown", 'grey')){
+  # Double cone palette
+  return(colorRampPalette(colors = colors)(n_colors))
+}
+
+SeuratV5toV4 = function(object, assay = 'RNA', ...){
+  
+  counts = attr(object@assays[[assay]], 'layers')$counts
+  features = attr(object@assays[[assay]], "meta.data")$gene_names
+  if(length(features) < 1) features = rownames(object[[assay]]@features)
+  meta = object@meta.data
+  
+  rownames(counts) = features
+  colnames(counts) = rownames(meta)
+  object2 = CreateSeuratObject(counts, ...)
+  object2@meta.data = meta
+  object2
+}
+
+kNNClassifier_fast = function(object, group.by, graph = 'integrated_snn') {
+  
+  g <- object@graphs[[graph]]
+  labels <- object@meta.data[[group.by]]
+  
+  # Identify unlabeled cells
+  unlabeled <- which(is.na(labels))
+  if (length(unlabeled) == 0) return(labels)
+  
+  labeled <- which(!is.na(labels))
+  
+  # Extract submatrix for unlabeled cells and their neighbors
+  # This avoids processing all cells in the loop
+  g_sub <- g[unlabeled, labeled, drop = FALSE]
+  
+  # Get labels for labeled cells
+  labeled_labels <- labels[labeled]
+  
+  # For each unlabeled cell, find the most common label among neighbors
+  # Using apply for vectorization
+  new_labels <- apply(g_sub, 1, function(x) {
+    # Find which labeled cells are neighbors (weight > 0)
+    neighbor_idx <- which(x > 0)
+    
+    if (length(neighbor_idx) == 0) return(NA)
+    
+    # Get weights and labels for neighbors
+    neighbor_weights <- x[neighbor_idx]
+    neighbor_labels <- labeled_labels[neighbor_idx]
+    
+    # Aggregate weights by label and find max
+    label_scores <- tapply(neighbor_weights, neighbor_labels, sum)
+    names(which.max(label_scores))
+  })
+  
+  # Update labels
+  result <- labels
+  result[unlabeled] <- new_labels
+  
+  return(result)
+}
+
+kNNClassifier2 = function(object, group.by, graph = 'integrated_snn'){
+  
+  g <- object@graphs[[graph]]
+  labels = object@meta.data[[group.by]] # cell type from scRNA-seq
+  # labels[object$orig.ident == 'patch-seq'] = NA # set patch-seq labels to NA
+  
+  # kNN classification of patch-seq cells
+  new_labels <- labels
+  unlabeled <- which(is.na(labels))
+  stopifnot(length(unlabeled) > 0)
+  
+  for (i in unlabeled) {
+    neigh <- which(g[i, ] > 0)
+    lab   <- labels[neigh]
+    w     <- g[i, neigh]
+    
+    keep <- !is.na(lab)
+    if (any(keep)) {
+      lab <- lab[keep]
+      w   <- w[keep]
+      
+      score <- tapply(w, lab, sum)
+      new_labels[i] <- names(which.max(score))
+    }
+  }
+  
+  return(new_labels)
+}
+
 kNNClassifier = function(object){
   
   g <- object@graphs$integrated_snn
@@ -140,9 +975,17 @@ SaturationCurve = function(object, prop.values = c(0.2, 0.4, 0.6, 0.7, 0.8, 0.9,
   })
 }
 
-scale_ticks_first_last <- function(axis = "y", expand = expansion(mult = c(0,0.01)), do = identity, ...) {
+scale_ticks_first_last <- function(axis = "y", 
+                                   expand = expansion(mult = c(0,0.01)), 
+                                   do = identity, 
+                                   FUN = NULL,
+                                   ...) {
+  
+  if(is.null(FUN) & axis == 'y') FUN = scale_y_continuous
+  if(is.null(FUN) & axis == 'x') FUN = scale_x_continuous
+  
   if (axis == "y") {
-    scale_y_continuous(
+    FUN(
       ...,
       labels = function(x) {
         x = do(x)
@@ -152,7 +995,7 @@ scale_ticks_first_last <- function(axis = "y", expand = expansion(mult = c(0,0.0
       expand = expand
     )
   } else if (axis == "x") {
-    scale_x_continuous(
+    FUN(
       ...,
       labels = function(x) {
         x = do(x)
@@ -688,7 +1531,14 @@ SnakePlot = function(mat,
 }
 
 row_norm = function(table){
-    matrix = table/rowSums(table)
+  
+  tab = as.data.frame.matrix(table)
+  
+  if(length(dim(tab)) == 1) {
+    return(tab / sum(tab))
+  } else {
+    tab / rowSums(tab)
+  }
 }
 
 col_norm = function(table){
@@ -901,7 +1751,7 @@ which_diff = function(x){
 }
 
 species_names_pretty = function(species_names){
-  species_names_pretty = gsub('CatShark|Shark|Cat shark', 'Catshark', 
+  species_names_pretty = gsub('CatShark|Shark|Cat shark', 'Shark', 
                               gsub('MouseLemur', 'Mouse lemur', 
                                    gsub('TreeShrew', 'Tree shrew', 
                                         gsub('ZebrafishLyu', 'Zebrafish', 
@@ -1587,11 +2437,22 @@ Col2Vec = function(x){
   x[,1] %>% setNames(rownames(x))
 }
 
-BidirectionalBestHits = function(matrix){
+BidirectionalBestHits = function(matrix, verbose = T){
+  
   row.max = as.data.frame(apply(matrix, 1, function(x) names(which.max(x)))) %>% rownames_to_column() %>% setNames(c('row', 'col'))
+  row.max$value = apply(matrix, 1, max)
   col.max = as.data.frame(apply(matrix, 2, function(x) names(which.max(x)))) %>% rownames_to_column() %>% setNames(c('col', 'row'))
-  df = rbind(row.max, col.max[,c(2,1)])
-  df[duplicated(df), ]
+  col.max$value = apply(matrix, 2, max)
+  df = rbind(row.max, col.max[,c(2,1,3)])
+  bidirectional = df[duplicated(df), ]
+  
+  # No clear match!
+  if(verbose){
+    print('No clear match!')
+    print(as.data.frame(anti_join(df, bidirectional)))
+  }
+  
+  bidirectional
 }
 
 OnOffBcClassification = function(object, gene = 'ISL1', cutoff = 50, plot = FALSE, 
@@ -1874,6 +2735,9 @@ RunIQTree2 = function(phydat, nthreads = 1, iqtree.model = 'MFP+ASC', verbose = 
 
 MultivariateR2 = function(data, cluster){
   
+  # Refactor 
+  cluster = factor(cluster)
+  
   # Mean of entire data
   grand_mean <- colMeans(data)
   
@@ -1884,7 +2748,7 @@ MultivariateR2 = function(data, cluster){
   group_means <- aggregate(data, by = list(cluster), FUN = mean)[, -1]
   
   # Cluster sizes
-  group_sizes <- table(cluster)
+  group_sizes <- table(factor(cluster))
   
   # Sum of squared deviances of group means from grand mean
   between_ss <- sum(group_sizes * rowSums((group_means - rep(grand_mean, each = length(unique(cluster))))^2))
@@ -2773,9 +3637,9 @@ PrettyBarplot = function(df, x, y, fill = 'lightgrey', remove.x = FALSE, ...){
 }
 
 
-ArialFont <- function() {
+ArialFont <- function(...) {
   theme(
-    text = element_text(family = "ArialMT")
+    text = element_text(family = "ArialMT", ...)
   )
 }
 
@@ -3049,11 +3913,15 @@ add_rectangle_annotation <- function(p, index, axis = "row", alpha = 0.3, color 
   y_range <- range(plot_data$y)
   
   if (axis == "column") {
-    rect_data <- data.frame(xmin = index - 0.5, xmax = index + 0.5, 
-                            ymin = y_range[1] - 0.5, ymax = y_range[2] + 0.5)
+    rect_data <- data.frame(xmin = index - 0.5, 
+                            xmax = index + 0.5, 
+                            ymin = y_range[1], 
+                            ymax = y_range[2])
   } else {  # axis == "row"
-    rect_data <- data.frame(xmin = x_range[1] - 0.5, xmax = x_range[2] + 0.5, 
-                            ymin = index - 0.5, ymax = index + 0.5)
+    rect_data <- data.frame(xmin = x_range[1] - 0.5, 
+                            xmax = x_range[2] + 0.5, 
+                            ymin = index - 0.5, 
+                            ymax = index + 0.5)
   }
   
   # Add annotation layer
@@ -3477,7 +4345,13 @@ PositiveCell = function(object, features, return.object = FALSE, plot.func = Fea
   }
 }
 
-DownloadEnsembl2 = function(path, speciesName = "Macaca_fascicularis", assembly = "Macaca_fascicularis", release = 112, version = '_6.0', primary = FALSE){
+DownloadEnsembl2 = function(path, 
+                            speciesName = "Macaca_fascicularis", 
+                            assembly = "Macaca_fascicularis", 
+                            release = 112, 
+                            version = '_6.0', 
+                            genome = FALSE, 
+                            primary = FALSE){
   
   setwd(path)
   
@@ -3495,7 +4369,7 @@ DownloadEnsembl2 = function(path, speciesName = "Macaca_fascicularis", assembly 
   # wget ftp://ftp.ensembl.org/pub/release-110/fasta/danio_rerio/pep/Danio_rerio.GRCz11.pep.all.fa.gz
   # curl -O ftp://ftp.ensembl.org/pub/release-110/fasta/danio_rerio/cdna/Danio_rerio.GRCz11.cdna.all.fa.gz
   
-  system2('curl', args = paste0('-O ', fasta.command))
+  if(genome) system2('curl', args = paste0('-O ', fasta.command))
   system2('curl', args = paste0('-O ', gtf.command))
   system2('curl', args = paste0('-O ', pep.command))
   system2('curl', args = paste0('-O ', cdna.command))
@@ -3618,7 +4492,9 @@ Heatmap2 = function(matrix,
                     label = FALSE, 
                     cluster_columns = FALSE, 
                     cluster_rows = FALSE,
+                    min.value = NULL,
                     max.value = NULL,
+                    parenthesis = NULL, 
                     label.fun = round,
                     label.size = 10,
                     font.family = 'ArialMT', 
@@ -3629,13 +4505,35 @@ Heatmap2 = function(matrix,
                     ...){
   
   if(is.null(label.matrix)) labels = matrix else labls = label.matrix
-  if(!is.null(max.value)){
-    matrix[matrix > max.value] = max.value
+  # if(!is.null(max.value)){
+  #   matrix[matrix > max.value] = max.value
+  # }
+  # if(!is.null(min.value)){
+  #   matrix[matrix < min.value] = min.value
+  # }
+  
+  # if(is.null(col)){
+  # }
+  
+  # Assign colors
+  if(is.null(min.value)) min.value = min(matrix)
+  if(is.null(max.value)) max.value = max(matrix)
+  cmap = colorRamp2(c(min.value, max.value), col)
+  
+  matrix = label.fun(matrix, 2)
+  if(!is.null(parenthesis)){
+    # labels.matrix = paste0(matrix + '\n(', parenthesis, ')')
+    labels.matrix <- matrix(paste0(matrix, "\n(", parenthesis, ")"),
+                     nrow = nrow(matrix), ncol = ncol(matrix),
+                     dimnames = dimnames(matrix))
+    label.fun = identity
+  } else {
+    labels.matrix = matrix
   }
   
   Heatmap(matrix, 
           name = legend.name, 
-          col = col, 
+          col = cmap, 
           column_title = title, 
           rect_gp = rect_gp,
           border_gp = border_gp, 
@@ -3647,7 +4545,7 @@ Heatmap2 = function(matrix,
           cluster_rows = cluster_rows,
           cell_fun = if(label) function(j, i, x, y, width, height, fill) { 
             if(!is.na(labels[i, j])) {
-              grid.text(label.fun(matrix[i, j], 2), x, y, gp = gpar(fontsize = label.size))
+              grid.text(labels.matrix[i, j], x, y, gp = gpar(fontsize = label.size))
             }
           } else NULL, 
           heatmap_legend_param = list(
@@ -3855,7 +4753,7 @@ LegendTopRight = function(x=1, y = 1, just = c(1,1), line.spacing = 1, size = 10
   )
 }
 
-LegendLowerLeft = function(x=0.01, y = 0.01, just = c(0,0), line.spacing = 1, size = 10, background.col = 'transparent', background.alpha = 0.5){
+LegendLowerLeft = function(x=0.01, y = 0.01, just = c(0,0), line.spacing = 1, size = 10, background.col = 'transparent', background.alpha = 0){
   theme(
     legend.position = c(x, y),  # Place the legend inside at the lower right
     legend.justification = just,  # Adjust the anchor point of the legend
@@ -4186,11 +5084,13 @@ smartReadRDS = function(filepath){
   }
 }
 
-VlnPlot2 = function(object, features = NULL, split.by = NULL, group.by = NULL, fill.by = 'feature', cols = NULL, idents = NULL, stack = FALSE, pt.size = 0, combine = TRUE){
+VlnPlot2 = function(object, features = NULL, split.by = NULL, group.by = NULL, 
+                    fill.by = 'feature', cols = NULL, 
+                    idents = NULL, stack = FALSE, pt.size = 0, combine = TRUE, ...){
   meta = Metadata(object, split.by, group.by)
   VlnPlot(object, features = features, split.by = split.by, group.by = group.by, stack = stack, 
           idents = idents, fill.by = fill.by, cols = cols[match(meta[[group.by]], names(cols))], 
-          pt.size = pt.size, combine = combine)
+          pt.size = pt.size, combine = combine, ...)
 }
 
 RunDESeq2 = function(object, ident.1, ident.2){
@@ -4633,8 +5533,8 @@ FindAllMarkersFast = function(object, group.by = 'seurat_clusters', p_val_adj_cu
 JSHeatmap2 = function(list1, list2, xlab = NULL, ylab = NULL, ari = FALSE, union.threshold = 0, ...){
   args = list(...)
   JSHeatmap(JSMatrix(table((list1), as.character(list2)), union.threshold = union.threshold), ...)+
-    {if(is.null(args$title) & ari) ggtitle(paste0('ARI = ', signif(adj.rand.index(list1, list2), 2)))}+ 
-    {if(!is.null(args$title) & ari) ggtitle(paste0(args$title, ' (ARI = ', signif(adj.rand.index(list1, list2), 2), ')'))}+ 
+    {if(is.null(args$title) & ari) ggtitle(paste0('ARI = ', round(adj.rand.index(list1, list2), 2)))}+ 
+    {if(!is.null(args$title) & ari) ggtitle(paste0(args$title, ' (ARI = ', round(adj.rand.index(list1, list2), 2), ')'))}+ 
     # {if(is.null(args$title) & !ari) }+  # do nothing
     {if(!is.null(args$title) & !ari) ggtitle(paste0(args$title))}+ 
     xlab(xlab)+
@@ -4802,12 +5702,21 @@ DEGTree = function(object, group.by = "annotated", title = NULL, mc.cores = 1, .
   return(dist)
 }
 
-Iterate = function(list, FUN, return.matrix = TRUE, ...){
-  outlist = lapply(seq_along(list[1:(length(list)-1)]), function(i) {
-    lapply((i+1):length(list), function(j){
-      FUN(list[[i]], list[[j]], ...)
+Iterate = function(list, FUN, list2 = NULL, return.matrix = TRUE, ...){
+  
+  if(is.null(list2)){
+    outlist = lapply(seq_along(list[1:(length(list)-1)]), function(i) {
+      lapply((i+1):length(list), function(j){
+        FUN(list[[i]], list[[j]], ...)
+      })
     })
-  })
+  } else {
+     matrix <- sapply(list2, function(a) {
+      sapply(list, function(b) FUN(a, b))
+    })
+    
+    return(matrix)
+  }
   
   if(return.matrix) {
     matrix = matrix(, nrow = length(list), ncol = length(list))
@@ -5418,14 +6327,16 @@ PrettyUmap2 = function(object, group.by = "seurat_clusters",
                        rasterise = FALSE, raster.dpi = 500,
                        centroid_fun = median, legend.point.size = 4, 
                        legend.font.size = 12, remove.times = 1,
+                       return.object = FALSE, 
                        ...){
   
   if(inherits(object, 'Seurat')){
-    data <- as.data.frame(Embeddings(object = object[["umap"]])[(colnames(object)), c(1, 2)])
+    data <- as.data.frame(Embeddings(object, reduction = 'umap')[(colnames(object)), c(1, 2)])
+    colnames(data) = c('UMAP_1', 'UMAP_2')
     
     # Add grouping information
     data$group.by <- object@meta.data[[group.by]]
-    
+
     # Add colors
     if(is.null(color.by)) {
       data$color.by <- object@meta.data[[group.by]]
@@ -5436,8 +6347,19 @@ PrettyUmap2 = function(object, group.by = "seurat_clusters",
     data = object
     
     data$group.by = data[[group.by]]
-    data$color.by = data[[group.by]]
+    # data$color.by = data[[group.by]]
+    
+    # Add colors
+    if(is.null(color.by)) {
+      data$color.by <- object[[group.by]]
+    } else {
+      data$color.by <- object[[color.by]]
+    }
   }
+  
+  
+  # Remove rows where groups are NA
+  # data = na.omit(data)
   
   remove_space_x = function(data){
     # largest x gap
@@ -5463,23 +6385,6 @@ PrettyUmap2 = function(object, group.by = "seurat_clusters",
   
   # Remove empty space by binning and removing chunks with no counts
   if(remove.space.x){
-    # # largest x gap
-    # hist_x = hist(data$UMAP_1, plot = FALSE, breaks=nbreaks)
-    # rle = rle(hist_x$counts)
-    # zero_indices = which(rle$values == 0)
-    # if(length(zero_indices) > 0){
-    #   counts = rle$lengths[zero_indices]
-    #   longest_zero_index = zero_indices[which.max(counts)]
-    #   firstZero = sum(rle$lengths[1:(longest_zero_index-1)])+1
-    #   secondZero = firstZero + counts[which.max(counts)] - 1
-    #   # secondZero = sum(rle$lengths[1:(longest_zero_index-2 + counts[which.max(counts)])])
-    #   # Check 
-    #   stopifnot(hist_x$counts[firstZero] == 0)
-    #   stopifnot(hist_x$counts[secondZero] == 0)
-    #   x_break1 = hist_x$mids[firstZero]
-    #   x_break2 = hist_x$mids[secondZero]
-    #   data[data$UMAP_1 < x_break1,"UMAP_1"] = data[data$UMAP_1 < x_break1,"UMAP_1"] + (x_break2 - x_break1)
-    # }
     for(i in seq_len(remove.times)){
       data = remove_space_x(data)
     }
@@ -5524,6 +6429,11 @@ PrettyUmap2 = function(object, group.by = "seurat_clusters",
   
   # Flip across y-axis
   if(flip.x) data[,"UMAP_1"] = -1*data[,"UMAP_1"]
+  
+  if(return.object) {
+    object@reductions$umap@cell.embeddings[, c(1, 2)] <- as.matrix(data[colnames(object), c('UMAP_1', 'UMAP_2')])
+    return(object)
+  }
   
   # Compute centroids for labeling
   raw_centroids = data.frame(x = sapply(unique(data$group.by), function(x) centroid_fun(data$UMAP_1[data$group.by == x])),
@@ -5896,13 +6806,7 @@ RenameFeatures = function(object, new.names){
   return(object)
 }
 
-# VlnPlot2 = function(object){
-#   VlnPlot(object, ...) + 
-#     NoLegend() + 
-#     theme(axis.title)
-# }
-
-SelectFeatures = function(object, features = NULL, nfeatures = 10000, min.pct.expressed = 10, group.by = "seurat_clusters", assay = "RNA", return.pct = FALSE){
+SelectFeatures = function(object, features = NULL, nfeatures = 20000, min.pct.expressed = 10, group.by = "seurat_clusters", assay = "RNA", return.pct = FALSE){
   
   object = FindVariableFeatures(object, selection.method = "vst", nfeatures = nrow(object@assays[[assay]]@data), verbose = FALSE)
   
@@ -6921,7 +7825,9 @@ TopN = function(table, group.by, sort.by, n = 10){
     ungroup() -> top
 }
 
-TopNDEGs = function(object, group.by = "annotated", n = 10, avg_log2FC_cutoff = 0.25, p_val_adj_cutoff = 0.05, only.positive = TRUE, sort.by = 'avg_log2FC', assay = 'RNA'){
+TopNDEGs = function(object, group.by = "annotated", n = 10, avg_log2FC_cutoff = 0.25, 
+                    p_val_adj_cutoff = 0.05, only.positive = TRUE, 
+                    sort.by = 'avg_log2FC', assay = 'RNA', gene.list = FALSE){
   
   if(inherits(object, 'Seurat')){
     # de_table = wilcoxauc(object, group_by = group.by) %>% 
@@ -6953,10 +7859,22 @@ TopNDEGs = function(object, group.by = "annotated", n = 10, avg_log2FC_cutoff = 
     top = top[order(top$cluster),]
   }
   
+  if(gene.list) return(split(top$gene, top$cluster))
+  
   top %>% as.data.frame 
 }
 
-CelltypeProportionBarplot = function(object, x = "annotated", y = "animal", return.table = FALSE, show.all = FALSE, normalize = TRUE){
+CelltypeProportionBarplot = function(object, 
+                                     x = "annotated", 
+                                     y = "animal", 
+                                     group.by = NULL,
+                                     return.table = FALSE, 
+                                     show.all = FALSE, 
+                                     normalize = TRUE, 
+                                     facet = TRUE, 
+                                     outline = 'grey20', 
+                                     subset.to = NULL,
+                                     ...){
   
   if(inherits(object, "Seurat")) {
     data = object@meta.data
@@ -6968,17 +7886,53 @@ CelltypeProportionBarplot = function(object, x = "annotated", y = "animal", retu
   if(is.factor(data[[x]])) data[[x]] = factor(factor(data[[x]], levels = (levels(data[[x]]))))
   
   tabulation = table(data[[y]], data[[x]])
-  normalized.tabulation = tabulation/rowSums(tabulation)
+  normalized.tabulation = tabulation / rowSums(tabulation)
   melted = reshape2::melt(normalized.tabulation) %>% setNames(c("Sample", "Type", "Proportion"))
   
+  # Add group metadata
+  if(!is.null(group.by)) {
+    metadata = Metadata(object, y, group.by)
+    melted$group = metadata[match(melted$Sample, metadata[[y]]),group.by]
+  }
+  
+  if(!is.null(subset.to)) melted = subset(melted, Type %in% subset.to)
+  
+  
   if(show.all){
-    p = ggplot(melted, aes(y = Proportion, x = Type, fill = Sample))+
-      geom_bar(stat = "identity", position="dodge") + 
-      theme_bw() + 
-      scale_fill_discrete(name = "Sample")+
-      ylab("Proportion") 
+    if(facet){
+      
+      p = ggplot(melted, aes(y = Proportion, x = Sample, fill = Type))+
+        geom_bar(stat = "identity", position="dodge", color = outline) + 
+        theme_bw() + 
+        facet_wrap(~ Type, ...)+
+        scale_fill_discrete(name = "Sample")+
+        ylab("Proportion") 
+    } else {
+      p = ggplot(melted, aes(y = Proportion, x = Type, fill = Sample))+
+        geom_bar(stat = "identity", position="dodge") + 
+        theme_bw() + 
+        scale_fill_discrete(name = "Sample")+
+        ylab("Proportion") 
+    }
+    
+  } else if(!is.null(group.by)){
+    p = ggbarplot(melted, 
+                  y = "Proportion", 
+                  x = 'group', 
+                  fill = 'group', 
+                  add = c("mean_se", "jitter"), 
+                  facet.by = 'Type',
+                  ...) + 
+      NoLegend() +
+      # facet_wrap(~ Type, ...)+
+      scale_y_continuous(expand = expansion(mult = c(0, .1)))
   } else {
-    p = ggbarplot(melted, y = "Proportion", x = "Type", fill = "Type", add = c("mean_se", "jitter")) + 
+    p = ggbarplot(melted, 
+                  y = "Proportion", 
+                  x = "Type", 
+                  fill = "Type", 
+                  add = c("mean_se", "jitter"), 
+                  ...) + 
       NoLegend() +
       scale_y_continuous(expand = expansion(mult = c(0, .1)))
     # rremove("xlab")
@@ -7352,6 +8306,9 @@ SeuratToH5ad = function(object, filepath, genes.remove = NULL, types.remove = NU
 }
 
 ExtractString = function(vector, before = NULL, after = NULL){
+  
+  library(stringr)
+  
   if(is.null(after)){
     return(str_split_fixed(vector, before, 2)[,2])
   } else if(is.null(before)){
@@ -7451,14 +8408,15 @@ ComputeM2 = function(original_clusters, permuted_clusters){
 }
 
 MatchClusters = function(reference, target, p.adj.threshold = 1e-10, overlap.threshold = 30, 
-                         jaccard.threshold = 0, return.key = FALSE, bidirectional = FALSE){
+                         jaccard.threshold = 0, return.key = FALSE, bidirectional = FALSE, 
+                         keep.missing = FALSE){
   
   # Overlap statistics
   overlap.stats = OverlapStatistics(table(reference, target))
   overlap.signif = subset(overlap.stats, pval < p.adj.threshold & overlap > overlap.threshold & jaccard > jaccard.threshold)
   
   if(bidirectional){
-    overlap.signif.one2one = BidirectionalBestHits(table(merged$seurat_clusters, merged$orthotype))
+    overlap.signif.one2one = BidirectionalBestHits(table(reference, target))
     colnames(overlap.signif.one2one) = c('ident1', 'ident2')
   } else {
     # Throw out multi-mapping clusters
@@ -7470,7 +8428,9 @@ MatchClusters = function(reference, target, p.adj.threshold = 1e-10, overlap.thr
   if(return.key) return(overlap.signif.one2one)
   
   # Assign new names
-  transferred = convert_values(reference, key = overlap.signif.one2one[,c('ident1', 'ident2')] %>% setNames(c('old.names', 'new.names')))
+  transferred = convert_values(reference, key = overlap.signif.one2one[,c('ident1', 'ident2')] %>% 
+                                 setNames(c('old.names', 'new.names')), 
+                               keep.missing = keep.missing)
   return(transferred)
 }
 
@@ -7918,7 +8878,8 @@ theme_umap = function(plt, remove.axes = FALSE, title = NULL, rename.axes = TRUE
   # Center title 
   plt2 = plt2 + 
     {if(!is.null(title)) ggtitle(title)}+ 
-    theme(plot.title = element_text(hjust = 0.5, face = "plain"), legend.title=element_blank())
+    theme(plot.title = element_text(hjust = 0.5, face = "plain"), legend.title=element_blank()) + 
+    ArialFont()
   
   return(plt2)
 }
@@ -8043,8 +9004,9 @@ CorrelationHeatmap = function(object,
                               features = NULL, 
                               title = NULL, 
                               label = FALSE, 
-                              cols = c("white", "red"), 
+                              cols = c("white", "red", 'darkred'), 
                               annotation_cols = NULL, 
+                              plot = TRUE, 
                               return.dendrogram = FALSE, 
                               return.matrix = FALSE,
                               return.plot = FALSE,
@@ -8123,7 +9085,7 @@ CorrelationHeatmap = function(object,
                  heatmap_legend_param = list(title = paste0(method, " R")),
                  top_annotation = ha, 
                  ...)
-    ht = draw(ht)
+    
   } else if(cluster_rows == TRUE){
     ht = Heatmap(type_cor, 
                  name = "cor", 
@@ -8138,7 +9100,7 @@ CorrelationHeatmap = function(object,
                  heatmap_legend_param = list(title = paste0(method, " R")),
                  top_annotation = ha, 
                  ...)
-    ht = draw(ht)
+    
   } else if(cluster_rows == FALSE){
     ht = Heatmap(type_cor, 
                  name = "cor", 
@@ -8154,10 +9116,12 @@ CorrelationHeatmap = function(object,
                  heatmap_legend_param = list(title = paste0(method, " R")),
                  top_annotation = ha, 
                  ...)
-    ht = draw(ht)
+    
   } else {
     stop('could not parse cluster_rows')
   }
+  
+  if(plot) ht = draw(ht)
   
   if(return.dendrogram) return(row_dend(ht))
   if(return.matrix) return(type_cor)
@@ -8581,9 +9545,11 @@ MultigeneDotPlot = function(object, genes, remove.titles = FALSE, no.legend = FA
   StackedPlots(plt.list = lapply(genes, function(gene) geneDotPlotFast(object, gene, ...)), remove.titles = remove.titles, no.legend = no.legend)
 }
 
-geneDotPlotFast = function(object, gene, group.by = "type", scale.within.species = TRUE, mini = FALSE, 
+geneDotPlotFast = function(object, gene, group.by = "orthotype", scale.within.species = TRUE, mini = FALSE, 
                            col.low = 'lightgrey', col.high = '#584B9FFF', mc.cores = 20, max.pct = 100, 
                            binarization = NULL){
+  
+  stopifnot(is.factor(object$species))
   
   if(scale.within.species){
     Idents(object) = object$species
@@ -9337,7 +10303,8 @@ ScatterPlot = function(data, x, y,
     {if(logY) scale_y_continuous(trans='log10')} +
     {if(!is.null(labels)) label_func(max.overlaps = max.overlaps, 
                                      min.segment.length = min.segment.length, 
-                                     size = label.size)}+
+                                     size = label.size, 
+                                     ...)}+
     theme(plot.title = element_text(hjust = 0.5))+
     ArialFont()+
     theme_dario()
@@ -9355,7 +10322,11 @@ JSMatrix = function(matrix, union.threshold = 0){
     for(column in seq_along(colSums)){
       intersection = matrix[row,column]
       union = rowSums[row] + colSums[column] - intersection
-      js_matrix[row,column] = intersection / union
+      if(union == 0) {
+        js_matrix[row,column] = 0
+      } else {
+        js_matrix[row,column] = intersection / union
+      }
       
       # If the union is too small, impute as zero (no trustworthy overlap)
       if(union < union.threshold) js_matrix[row,column] = 0
@@ -9602,7 +10573,7 @@ LIBRARIES = c('paletteer', 'tidyverse', 'Seurat', 'ggplot2', 'reshape2',
               'openxlsx', 'lisi', 'ggpubr', 'doParallel', 'circlize', 
               'viridis', 'ComplexHeatmap', 'Polychrome', 
               'HGNChelper', 'openxlsx', 'Matrix', 'patchwork', 'colorspace', 
-              'ape', 'dendextend')
+              'ape', 'dendextend', 'qs2')
 
 LoadLibraries = function(load.lisi = TRUE, verbose = FALSE){
 
@@ -9612,9 +10583,15 @@ LoadLibraries = function(load.lisi = TRUE, verbose = FALSE){
   if(verbose) return(res)
 }
 
-SourceFiles = function(path = '../../utils/'){
+SourceFiles = function(path = '../../utils/', objects = TRUE, AC = FALSE){
   filenames = c('xgboost_train.R', 'utilFxns.R', 'xgboost_train.R', 'plottingFxns.R',
-                'dario_functions.R', 'wrappers.R', 'objects.R', 'xgboost_train_DT.R', 'SmartMatrix.R')
+                'dario_functions.R', 'wrappers.R', 
+                'objects.R', 'objects_AC.R', 'xgboost_train_DT.R', 
+                'SmartMatrix.R', 'SeuratV5_functions.R')
+  
+  # Remove files? 
+  if(!objects) filenames = setdiff(filenames, 'objects.R')
+  if(!AC) filenames = setdiff(filenames, 'objects_AC.R')
   
   lapply(filenames, function(filename) source(paste0(path, filename)))
   
@@ -9632,14 +10609,14 @@ DoubletAnalysis = function(object, group.by = "seurat_clusters"){
     nrow = 2)
 }
 
-BrowseSeurat = function(object, batch = "animal"){
+BrowseSeurat = function(object, batch = "animal", group.by = 'seurat_clusters'){
   if(is.null(object@meta.data[["percent.mt"]])) object[["percent.mt"]] <- PercentageFeatureSet(object, pattern = "^MT-")
-  plot = plot_grid(DimPlot(object, label = TRUE) + NoLegend(), 
-                   ClusterBatchPlot(object, batch = batch, shuffle = TRUE) + NoLegend(), 
-                   ClusterFeaturePlot(object, features = "nFeature_RNA") + NoLegend(),
-                   VlnPlot(object, "nCount_RNA", pt.size = 0) + RotatedAxis() + NoLegend(), 
-                   VlnPlot(object, "nFeature_RNA", pt.size = 0) + RotatedAxis() + NoLegend(), 
-                   VlnPlot(object, "percent.mt", pt.size = 0) + RotatedAxis() + NoLegend(),
+  plot = plot_grid(DimPlot(object, group.by = group.by, label = TRUE, shuffle = T, repel = T) + NoLegend(), 
+                   ClusterBatchPlot(object, batch = batch, group.by = group.by, shuffle = TRUE) + NoLegend(), 
+                   ClusterFeaturePlot(object, features = "nFeature_RNA", group.by = group.by) + NoLegend(),
+                   VlnPlot(object, "nCount_RNA", group.by = group.by, pt.size = 0) + RotatedAxis() + NoLegend(), 
+                   VlnPlot(object, "nFeature_RNA", group.by = group.by, pt.size = 0) + RotatedAxis() + NoLegend(), 
+                   VlnPlot(object, "percent.mt", group.by = group.by, pt.size = 0) + RotatedAxis() + NoLegend(),
                    nrow = 2, ncol = 3, labels = LETTERS)
   return(plot)
 }
@@ -9701,11 +10678,11 @@ ClusterBatchPlot <- function(object, batch = "orig.file", group.by = "seurat_clu
   return(LabelClusters(plot, id = "seurat_clusters"))
 }
 
-ClusterFeaturePlot <- function(object, group.by = "seurat_clusters", ...){
+ClusterFeaturePlot <- function(object, group.by = "seurat_clusters", repel = FALSE, ...){
   # args = list(...)
   plot = FeaturePlot(object, ...)
   plot$data$seurat_clusters <- as.factor(object@meta.data[[group.by]])
-  return(LabelClusters(plot, id = "seurat_clusters"))
+  return(LabelClusters(plot, id = "seurat_clusters", repel = repel))
 }
 
 plotBatches2 = function(SeuratObject, batch = "orig.file", clusters = "seurat_clusters"){
@@ -9753,8 +10730,14 @@ FindDimensions = function(object, nPCs = 50){
 }
 
 Harmonize = function(SeuratObject, batch = "orig.file", nPCs = 20, cluster_resolution = 0.5, 
-                     k.param = 20, show.plots = TRUE, run.umap = TRUE, save.clusters = FALSE, 
-                     lambda = NULL){
+                     k.param = 20, show.plots = FALSE, run.umap = TRUE, save.clusters = FALSE, 
+                     lambda = NULL, remove.batches = 60, verbose = FALSE){
+  
+  # Remove tiny batches to avoid singular matrices
+  SeuratObject@meta.data[,batch] = as.character(SeuratObject@meta.data[,batch])
+  batches.remove = names(which(table(SeuratObject@meta.data[,batch]) < remove.batches))
+  message("Removing batches: ", paste0(batches.remove, collapse = ", "))
+  SeuratObject = SeuratObject[,!SeuratObject@meta.data[,batch] %in% batches.remove]
   
   # Save old clusters
   if(save.clusters) SeuratObject$old_seurat_clusters = SeuratObject$seurat_clusters
@@ -9785,17 +10768,23 @@ Harmonize = function(SeuratObject, batch = "orig.file", nPCs = 20, cluster_resol
   if(!run.umap){
     harmony <- harmony %>%
       FindNeighbors(reduction = "harmony", dims = 1:nPCs, k.param = k.param) %>%
-      FindClusters(resolution = cluster_resolution) %>%
+      FindClusters(resolution = cluster_resolution, verbose = verbose) %>%
       identity()
   } else {
     harmony <- harmony %>%
       RunUMAP(reduction = "harmony", dims = 1:nPCs) %>%
       FindNeighbors(reduction = "harmony", dims = 1:nPCs, k.param = k.param) %>%
-      FindClusters(resolution = cluster_resolution) %>%
+      FindClusters(resolution = cluster_resolution, verbose = verbose) %>%
       identity()
   }
   
-  return(harmony)
+  return(OneBasedClusters(harmony))
+}
+
+OneBasedClusters = function(object, group.by = 'seurat_clusters'){
+  object@meta.data[[group.by]] <- as.factor(as.integer(object@meta.data[[group.by]]))
+  Idents(object) <- object@meta.data[[group.by]]
+  object
 }
 
 RobustResolution = function(object, from = 0.5, to = 1.5, by = 0.1, mc.cores = 10){
